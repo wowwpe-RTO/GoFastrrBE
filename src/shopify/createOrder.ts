@@ -1,30 +1,33 @@
 import axios from "axios";
 import { getPool } from "../db";
-import { getToken } from "../storeTokens";
+import { getToken } from "../services/shopTokenService";
+import { CheckoutStep } from "../domain/checkoutStates";
 
-/**
- * Creates a Shopify order from a PAID checkout session
- * Idempotent, transaction-safe
- */
-export async function createShopifyOrder(
-  checkoutSessionId: string
-) {
+export async function createShopifyOrder(checkoutSessionId: string) {
   const pool = getPool();
-
-  await pool.query("BEGIN");
+  const client = await pool.connect();
 
   try {
-    /**
-     * 1️⃣ Lock checkout session
-     */
-    const sessionResult = await pool.query(
+    await client.query("BEGIN");
+
+    /* --------------------------------------------------
+       LOCK CHECKOUT SESSION
+    -------------------------------------------------- */
+
+    const sessionResult = await client.query(
       `
       SELECT
-        id,
+        step,
         shop,
         phone,
+        email,
         shipping_address,
-        shopify_order_id
+        shopify_order_id,
+        subtotal_amount,
+        shipping_amount,
+        tax_amount,
+        total_amount,
+        currency
       FROM checkout_sessions
       WHERE id = $1
       FOR UPDATE
@@ -32,82 +35,193 @@ export async function createShopifyOrder(
       [checkoutSessionId]
     );
 
-    if (sessionResult.rowCount === 0) {
-      throw new Error("Checkout session not found");
+    if (!sessionResult.rowCount) {
+      throw new Error("Checkout not found");
     }
 
-    const session = sessionResult.rows[0];
+    const s = sessionResult.rows[0];
 
-    /**
-     * 🛑 Idempotency guard
-     */
-    if (session.shopify_order_id) {
-      await pool.query("COMMIT");
-      return {
-        id: session.shopify_order_id,
-        alreadyCreated: true,
-      };
+    /* --------------------------------------------------
+       IDEMPOTENCY
+    -------------------------------------------------- */
+
+    if (s.shopify_order_id) {
+      await client.query("COMMIT");
+      return { id: s.shopify_order_id, alreadyCreated: true };
     }
 
-    /**
-     * 2️⃣ Fetch Shopify token
-     */
-    const accessToken = await getToken(session.shop);
-    if (!accessToken) {
+    /* --------------------------------------------------
+       STATE GUARD
+    -------------------------------------------------- */
+
+    if (s.step !== "COMPLETED") {
+  await client.query("ROLLBACK");
+  return {
+    skipped: true,
+    reason: `Checkout not completed. Current state: ${s.step}`,
+  };
+}
+
+    /* --------------------------------------------------
+       FETCH LINE ITEMS (SOURCE OF TRUTH)
+    -------------------------------------------------- */
+
+    const itemsResult = await client.query(
+      `
+      SELECT
+        variant_id,
+        quantity,
+        unit_price_paise,
+        title
+      FROM checkout_line_items
+      WHERE checkout_session_id = $1
+      `,
+      [checkoutSessionId]
+    );
+
+    if (!itemsResult.rowCount) {
       throw new Error(
-        `Missing Shopify access token for shop ${session.shop}`
+        `No line items found for checkout ${checkoutSessionId}`
       );
     }
 
-    /**
-     * 3️⃣ Build order payload
-     */
+    const cartItems = itemsResult.rows;
+
+    if (!s.total_amount || Number(s.total_amount) <= 0) {
+      throw new Error(
+        `Invalid totals for checkout ${checkoutSessionId}`
+      );
+    }
+
+    if (!s.shipping_address) {
+      throw new Error(
+        `Shipping address missing for checkout ${checkoutSessionId}`
+      );
+    }
+
+    const token = await getToken(s.shop);
+    if (!token) {
+      throw new Error("Missing Shopify token");
+    }
+
+    /* --------------------------------------------------
+       FREEZE AMOUNTS
+    -------------------------------------------------- */
+
+    const subtotal = (Number(s.subtotal_amount) / 100).toFixed(2);
+    const shipping = (Number(s.shipping_amount) / 100).toFixed(2);
+    const totalTax = (Number(s.tax_amount || 0) / 100).toFixed(2);
+    const total = (Number(s.total_amount) / 100).toFixed(2);
+
+    const money = (v: string) => ({
+      shop_money: { amount: v, currency_code: s.currency },
+      presentment_money: { amount: v, currency_code: s.currency },
+    });
+
+    /* --------------------------------------------------
+       BUILD SHOPIFY ORDER
+    -------------------------------------------------- */
+
     const orderPayload = {
       order: {
-        line_items: [
+        email: s.email,
+        phone: s.phone,
+
+        inventory_behavior: "decrement_ignoring_policy",
+
+        currency: s.currency,
+        presentment_currency: s.currency,
+
+        financial_status: "paid",
+        taxes_included: true,
+
+        line_items: cartItems.map((i: any) => ({
+          variant_id: Number(i.variant_id),
+          quantity: Number(i.quantity),
+          price: (Number(i.unit_price_paise) / 100).toFixed(2),
+          title: i.title,
+        })),
+
+        shipping_address: s.shipping_address,
+
+        shipping_lines: [
           {
-            variant_id: 46873673498802, // TODO: replace later
-            quantity: 1,
+            title: "Shipping",
+            price: shipping,
+            code: "custom",
+            source: "custom",
+            price_set: money(shipping),
           },
         ],
-        shipping_address: session.shipping_address,
-        phone: session.phone,
-        financial_status: "paid",
+
+        tax_lines: [],
+
+        subtotal_price: subtotal,
+        total_line_items_price: subtotal,
+        total_tax: totalTax,
+        total_price: total,
+        total_discounts: "0.00",
+
+        subtotal_price_set: money(subtotal),
+        total_line_items_price_set: money(subtotal),
+        total_shipping_price_set: money(shipping),
+        total_tax_set: money(totalTax),
+        total_price_set: money(total),
+
+        transactions: [
+          {
+            kind: "sale",
+            status: "success",
+            amount: total,
+            currency: s.currency,
+            gateway: "razorpay",
+          },
+        ],
       },
     };
 
-    /**
-     * 4️⃣ Create order in Shopify
-     */
-    const response = await axios.post(
-      `https://${session.shop}/admin/api/2024-01/orders.json`,
+    const resp = await axios.post(
+      `https://${s.shop}/admin/api/2025-01/orders.json`,
       orderPayload,
       {
         headers: {
-          "X-Shopify-Access-Token": accessToken,
+          "X-Shopify-Access-Token": token.trim(),
           "Content-Type": "application/json",
         },
+        timeout: 20000,
       }
     );
 
-    const order = response.data.order;
+    const order = resp.data?.order;
 
-    /**
-     * 5️⃣ Persist Shopify order ID (idempotent)
-     */
-    await pool.query(
+    if (!order?.id) {
+      throw new Error(
+        `Shopify order creation failed: ${JSON.stringify(resp.data)}`
+      );
+    }
+
+    /* --------------------------------------------------
+       MARK COMPLETED
+    -------------------------------------------------- */
+
+    await client.query(
       `
       UPDATE checkout_sessions
-      SET shopify_order_id = $1
-      WHERE id = $2
+      SET shopify_order_id = $1,
+          step = $2,
+          updated_at = now()
+      WHERE id = $3
       `,
-      [order.id, checkoutSessionId]
+      [order.id, CheckoutStep.COMPLETED, checkoutSessionId]
     );
 
-    await pool.query("COMMIT");
+    await client.query("COMMIT");
+
     return order;
   } catch (err) {
-    await pool.query("ROLLBACK");
+    await client.query("ROLLBACK");
     throw err;
+  } finally {
+    client.release();
   }
 }

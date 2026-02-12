@@ -1,18 +1,38 @@
 import { Router } from "express";
+import crypto from "crypto";
+import { z } from "zod";
 import Razorpay from "razorpay";
+import { checkoutLimiter } from "../middleware/rateLimit";
 import { getPool } from "../db";
-
 import { CheckoutStep } from "../domain/checkoutStates";
 import { assertTransition } from "../domain/checkoutTransitions";
 
 const router = Router();
 
+/* ---------------- Schemas ---------------- */
 
-/**
- * ----------------------------------------
- * Razorpay client (singleton)
- * ----------------------------------------
- */
+const addressSchema = z.object({
+  checkoutSessionId: z.string().uuid(),
+  email: z.string().email(),
+  phone: z.string(),
+  address: z.object({
+    firstName: z.string(),
+    lastName: z.string(),
+    line1: z.string(),
+    city: z.string(),
+    state: z.string(),
+    postalCode: z.string(),
+    country: z.string(),
+  }),
+});
+
+const payInitSchema = z.object({
+  checkoutSessionId: z.string().uuid(),
+  gateway: z.literal("razorpay"),
+});
+
+/* ---------------- Razorpay ---------------- */
+
 function getRazorpayClient() {
   if (!process.env.RAZORPAY_KEY_ID || !process.env.RAZORPAY_KEY_SECRET) {
     throw new Error("Razorpay env vars missing");
@@ -24,339 +44,301 @@ function getRazorpayClient() {
   });
 }
 
-/**
- * ----------------------------------------
- * POST /checkout/address
- * OTP_VERIFIED → ADDRESS_SAVED
- * ----------------------------------------
- */
+/* ======================================================
+   ADDRESS
+====================================================== */
+
 router.post("/address", async (req, res) => {
   const pool = getPool();
-  const { checkoutSessionId, address } = req.body;
+  const parsed = addressSchema.safeParse(req.body);
 
-  if (!checkoutSessionId || !address) {
-    return res.status(400).json({
-      error: "checkoutSessionId and address are required",
-    });
+  if (!parsed.success) {
+    return res.status(400).json({ error: "Invalid payload" });
   }
 
-  const requiredFields = [
-    "firstName",
-    "lastName",
-    "line1",
-    "city",
-    "state",
-    "postalCode",
-    "country",
-  ];
+  const { checkoutSessionId, address, email, phone } = parsed.data;
 
-  for (const field of requiredFields) {
-    if (!address[field]) {
-      return res.status(400).json({
-        error: `Missing address field: ${field}`,
-      });
-    }
-  }
+  const client = await pool.connect();
 
-  /**
-   * 1️⃣ Load checkout session
-   */
-  const sessionResult = await pool.query(
-    `
-    SELECT step
-    FROM checkout_sessions
-    WHERE id = $1
-    `,
-    [checkoutSessionId]
-  );
-
-  if (sessionResult.rowCount === 0) {
-    return res.status(404).json({ error: "Checkout session not found" });
-  }
-
-  const currentStep = sessionResult.rows[0].step;
-
-  /**
-   * 2️⃣ Idempotency guard
-   */
-  if (currentStep === CheckoutStep.ADDRESS_SAVED) {
-    // Already saved → safe retry
-    return res.json({
-      success: true,
-      checkoutSessionId,
-      step: CheckoutStep.ADDRESS_SAVED,
-    });
-  }
-
-  /**
-   * 3️⃣ Enforce valid transition
-   */
-  assertTransition(currentStep, CheckoutStep.ADDRESS_SAVED);
-
-  /**
-   * 4️⃣ Pricing (server-authoritative)
-   */
-  const UNIT_PRICE_PAISE = 259800;
-  const quantity = 1;
-  const totalAmountPaise = UNIT_PRICE_PAISE * quantity;
-
-
-  console.log(JSON.stringify({
-      event: "checkout_transition",
-      checkoutSessionId,
-      from: currentStep,
-      to: CheckoutStep.ADDRESS_SAVED
-    }));
-  /**
-   * 5️⃣ Persist address + transition
-   */
-  await pool.query(
-    `
-    UPDATE checkout_sessions
-    SET
-      shipping_address = $1,
-      total_amount = $2,
-      currency = 'INR',
-      step = $3,
-      updated_at = now()
-    WHERE id = $4
-    `,
-    [
-      address,
-      totalAmountPaise,
-      CheckoutStep.ADDRESS_SAVED,
-      checkoutSessionId,
-    ]
-  );
-
-  return res.json({
-    success: true,
-    checkoutSessionId,
-    totalAmountPaise,
-    step: CheckoutStep.ADDRESS_SAVED,
-  });
-});
-
-
-
-
-/**
- * ----------------------------------------
- * POST /checkout/pay/init
- * ADDRESS_SAVED → PAYMENT_INITIATED
- * ----------------------------------------
- */
-router.post("/pay/init", async (req, res) => {
-  const pool = getPool();
   try {
-    const { checkoutSessionId, gateway } = req.body;
+    await client.query("BEGIN");
 
-    if (!checkoutSessionId || gateway !== "razorpay") {
-      return res.status(400).json({
-        error: "checkoutSessionId and valid gateway required",
-      });
-    }
-
-    /**
-     * 1️⃣ Load checkout session
-     */
-    const sessionResult = await pool.query(
-      `
-      SELECT step, total_amount, currency
-      FROM checkout_sessions
-      WHERE id = $1
-      `,
+    const sessionResult = await client.query(
+      `SELECT step, shop, subtotal_amount, discount_amount
+       FROM checkout_sessions
+       WHERE id = $1
+       FOR UPDATE`,
       [checkoutSessionId]
     );
 
-    if (sessionResult.rowCount === 0) {
-      return res.status(404).json({ error: "Checkout session not found" });
+    if (!sessionResult.rowCount) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ error: "Checkout not found" });
     }
 
     const session = sessionResult.rows[0];
 
-    // 🔒 Terminal states
-if (session.step === CheckoutStep.COMPLETED) {
-  return res.status(409).json({
-    error: "Checkout already completed",
-    step: session.step,
-  });
-}
+    assertTransition(session.step, CheckoutStep.ADDRESS_SAVED);
 
-if (session.step === CheckoutStep.FAILED) {
-  return res.status(409).json({
-    error: "Checkout failed. Please restart checkout.",
-    step: session.step,
-  });
-}
+    const subtotal = Number(session.subtotal_amount || 0);
+    const discount = Number(session.discount_amount || 0);
+    const taxableAmount = Math.max(subtotal - discount, 0);
 
-// 🔁 Idempotency: already initiated
-if (session.step === CheckoutStep.PAYMENT_INITIATED) {
-  const existing = await pool.query(
+    /* ---------- Shipping Zone Lookup ---------- */
+
+    const zone = await client.query(
+      `
+      SELECT shipping_rate, min_order
+      FROM shipping_zones
+      WHERE shop = $1
+        AND country = $2
+        AND (state IS NULL OR state = $3)
+      ORDER BY state DESC
+      LIMIT 1
+      `,
+      [session.shop, address.country, address.state]
+    );
+
+    let shippingAmount = 5000;
+
+    if (zone.rowCount) {
+      const z = zone.rows[0];
+      shippingAmount =
+        taxableAmount >= Number(z.min_order)
+          ? 0
+          : Number(z.shipping_rate);
+    }
+
+    /* ---------- GST ---------- */
+
+    const settings = await client.query(
+      `SELECT tax_rate FROM shop_settings WHERE shop = $1`,
+      [session.shop]
+    );
+
+    const taxRate = Number(settings.rows[0]?.tax_rate || 0);
+    const totalTax = Math.round(taxableAmount * taxRate);
+
+    let cgst = 0;
+    let sgst = 0;
+    let igst = 0;
+
+    if (address.country === "IN") {
+      cgst = Math.round(totalTax / 2);
+      sgst = totalTax - cgst;
+    } else {
+      igst = totalTax;
+    }
+
+    const totalAmount =
+      taxableAmount + shippingAmount + totalTax;
+
+    const cartHash = crypto
+      .createHash("sha256")
+      .update(
+        JSON.stringify({
+          subtotal,
+          discount,
+          shippingAmount,
+          cgst,
+          sgst,
+          igst,
+          totalAmount,
+        })
+      )
+      .digest("hex");
+
+    await client.query(
+      `
+      UPDATE checkout_sessions
+      SET
+        shipping_address = $1,
+        email = $2,
+        phone = $3,
+        shipping_amount = $4,
+        tax_amount = $5,
+        cgst_amount = $6,
+        sgst_amount = $7,
+        igst_amount = $8,
+        total_amount = $9,
+        cart_hash = $10,
+        step = $11,
+        updated_at = now()
+      WHERE id = $12
+      `,
+      [
+        address,
+        email,
+        phone,
+        shippingAmount,
+        totalTax,
+        cgst,
+        sgst,
+        igst,
+        totalAmount,
+        cartHash,
+        CheckoutStep.ADDRESS_SAVED,
+        checkoutSessionId,
+      ]
+    );
+
+    await client.query("COMMIT");
+
+    return res.json({
+      success: true,
+      checkoutSessionId,
+      totalAmount,
+      step: CheckoutStep.ADDRESS_SAVED,
+    });
+  } catch (err) {
+    await client.query("ROLLBACK");
+    console.error("Address update failed:", err);
+    return res.status(500).json({ error: "Address save failed" });
+  } finally {
+    client.release();
+  }
+});
+
+/* ======================================================
+   PAY INIT (HARDENED)
+====================================================== */
+
+router.post("/pay/init", checkoutLimiter, async (req, res) => {
+  const pool = getPool();
+  const parsed = payInitSchema.safeParse(req.body);
+
+  if (!parsed.success)
+    return res.status(400).json({ error: "Bad payload" });
+
+  const { checkoutSessionId } = parsed.data;
+
+  const r = await pool.query(
     `
-    SELECT gateway_order_id
-    FROM payments
-    WHERE checkout_session_id = $1
-      AND gateway = 'razorpay'
-    ORDER BY created_at DESC
-    LIMIT 1
+    SELECT
+      step,
+      total_amount,
+      currency,
+      cart_hash
+    FROM checkout_sessions
+    WHERE id = $1
     `,
     [checkoutSessionId]
   );
 
-  const existingCount = existing.rowCount ?? 0;
+  if (!r.rowCount)
+    return res.status(404).json({ error: "Checkout not found" });
 
-  if (existingCount > 0) {
-    return res.json({
-      gateway: "razorpay",
-      gatewayOrderId: existing.rows[0].gateway_order_id,
-      amountPaise: session.total_amount,
-      currency: session.currency,
-      key: process.env.RAZORPAY_KEY_ID,
+  const s = r.rows[0];
+
+  /* ---------- HARD GUARDS ---------- */
+
+  if (s.step !== CheckoutStep.ADDRESS_SAVED) {
+    return res.status(400).json({
+      error: "Address not completed",
+      code: "ADDRESS_REQUIRED",
     });
   }
-}
 
-// ✅ Only now enforce transition
-assertTransition(
-  session.step,
-  CheckoutStep.PAYMENT_INITIATED
-);
+  if (!s.total_amount || Number(s.total_amount) <= 0) {
+    return res.status(400).json({
+      error: "Invalid checkout totals",
+      code: "TOTALS_MISSING",
+    });
+  }
 
+  if (!s.cart_hash) {
+    return res.status(400).json({
+      error: "Checkout not finalized",
+      code: "CHECKOUT_NOT_FINALIZED",
+    });
+  }
 
-    const amountPaise = Number(session.total_amount);
-    if (!Number.isInteger(amountPaise) || amountPaise <= 0) {
-      return res.status(400).json({ error: "Invalid amount" });
-    }
+  const razorpay = getRazorpayClient();
+  const amountPaise = Math.round(Number(s.total_amount));
 
-    /**
-     * 3️⃣ Check existing payment (IDEMPOTENCY)
-     */
-    const existing = await pool.query(
+  const order = await razorpay.orders.create({
+    amount: amountPaise,
+    currency: s.currency,
+    receipt: `ck_${checkoutSessionId.slice(0, 32)}`,
+  });
+
+  await pool.query(
+    `
+    INSERT INTO payments(
+      id,checkout_session_id,gateway,gateway_order_id,
+      amount_paise,currency,status,created_at,updated_at
+    )
+    VALUES(gen_random_uuid(),$1,'razorpay',$2,$3,$4,'CREATED',now(),now())
+    `,
+    [checkoutSessionId, order.id, amountPaise, s.currency]
+  );
+
+  await pool.query(
+    `UPDATE checkout_sessions
+     SET step=$1, updated_at=now()
+     WHERE id=$2`,
+    [CheckoutStep.PAYMENT_INITIATED, checkoutSessionId]
+  );
+
+  return res.json({
+    gateway: "razorpay",
+    gatewayOrderId: order.id,
+    amountPaise,
+    currency: s.currency,
+    key: process.env.RAZORPAY_KEY_ID,
+  });
+});
+
+/* ======================================================
+   STATUS
+====================================================== */
+
+router.get("/status/:id", async (req, res) => {
+  const pool = getPool();
+
+  try {
+    const checkoutSessionId = req.params.id;
+
+    const result = await pool.query(
       `
-      SELECT gateway_order_id
-      FROM payments
-      WHERE checkout_session_id = $1
-        AND gateway = 'razorpay'
+      SELECT
+        c.id,
+        c.step,
+        c.shopify_order_id,
+        c.total_amount,
+        c.currency,
+        p.gateway_order_id,
+        p.status AS payment_status
+      FROM checkout_sessions c
+      LEFT JOIN payments p
+        ON p.checkout_session_id = c.id
+       AND p.gateway = 'razorpay'
+      WHERE c.id = $1
+      ORDER BY p.created_at DESC
+      LIMIT 1
       `,
       [checkoutSessionId]
     );
 
-    if ((existing.rowCount ?? 0) > 0) {
-      return res.json({
-        gateway: "razorpay",
-        gatewayOrderId: existing.rows[0].gateway_order_id,
-        amountPaise,
-        currency: session.currency,
-        key: process.env.RAZORPAY_KEY_ID,
-      });
+    if (!result.rowCount) {
+      return res.status(404).json({ error: "Checkout not found" });
     }
 
-    /**
-     * 4️⃣ Create Razorpay order
-     */
-    const razorpay = getRazorpayClient();
-
-    const order = await razorpay.orders.create({
-      amount: amountPaise,
-      currency: session.currency,
-      receipt: `ck_${checkoutSessionId.slice(0, 32)}`,
-    });
-
-    /**
-     * 5️⃣ Insert payment (DB-locked)
-     */
-    await pool.query(
-      `
-      INSERT INTO payments (
-        id,
-        checkout_session_id,
-        gateway,
-        gateway_order_id,
-        amount_paise,
-        currency,
-        status,
-        created_at,
-        updated_at
-      )
-      VALUES (
-        gen_random_uuid(),
-        $1,
-        'razorpay',
-        $2,
-        $3,
-        $4,
-        'CREATED',
-        now(),
-        now()
-      )
-      `,
-      [
-        checkoutSessionId,
-        order.id,
-        amountPaise,
-        session.currency,
-      ]
-    );
-
-    
-
-    /**
-     * 6️⃣ Transition checkout
-     */
-    await pool.query(
-      `
-      UPDATE checkout_sessions
-      SET step = $1, updated_at = now()
-      WHERE id = $2
-      `,
-      [CheckoutStep.PAYMENT_INITIATED, checkoutSessionId]
-    );
+    const row = result.rows[0];
 
     return res.json({
-      gateway: "razorpay",
-      gatewayOrderId: order.id,
-      amountPaise,
-      currency: session.currency,
-      key: process.env.RAZORPAY_KEY_ID,
+      checkoutSessionId: row.id,
+      step: row.step,
+      shopifyOrderId: row.shopify_order_id,
+      paymentStatus: row.payment_status,
+      gatewayOrderId: row.gateway_order_id,
+      totalAmountPaise: Number(row.total_amount),
+      currency: row.currency,
     });
   } catch (err) {
-    console.error("❌ /checkout/pay/init failed:", err);
-    return res.status(500).json({
-      error: "Payment initialization failed",
-    });
+    console.error("Status fetch failed:", err);
+    return res.status(500).json({ error: "Status lookup failed" });
   }
-});
-
-/**
- * ----------------------------------------
- * GET /checkout/status/:id
- * Frontend polling endpoint
- * ----------------------------------------
- */
-router.get("/status/:id", async (req, res) => {
-  const pool = getPool();
-  const { id } = req.params;
-
-  const result = await pool.query(
-    `
-    SELECT
-      step,
-      shopify_order_id
-    FROM checkout_sessions
-    WHERE id = $1
-    `,
-    [id]
-  );
-
-  if (result.rowCount === 0) {
-    return res.status(404).json({ error: "Not found" });
-  }
-
-  return res.json({
-    step: result.rows[0].step,
-    shopifyOrderId: result.rows[0].shopify_order_id,
-  });
 });
 
 export default router;

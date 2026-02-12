@@ -1,37 +1,77 @@
 import { Router } from "express";
 import axios from "axios";
 import crypto from "crypto";
-import { storeTokens } from "../storeTokens";
+import querystring from "querystring";
+import { setToken } from "../services/shopTokenService";
+import { registerOrdersCreateWebhook } from "../shopify/createWebhook";
 
 const router = Router();
 
 const SCOPES =
-  "read_products,write_draft_orders,read_customers,write_customers";
+  "read_customers,write_draft_orders,read_products,read_orders,write_orders,write_customers";
 
-// 1️⃣ Install URL
+/**
+ * ----------------------------------------
+ * Shopify HMAC verification
+ * ----------------------------------------
+ */
+function verifyOAuthHmac(query: Record<string, string>) {
+  const { hmac, ...rest } = query;
+  if (!hmac) return false;
+
+  const message = querystring.stringify(rest);
+
+  const generated = crypto
+    .createHmac("sha256", process.env.SHOPIFY_API_SECRET!)
+    .update(message)
+    .digest("hex");
+
+  return crypto.timingSafeEqual(
+    Buffer.from(generated, "utf8"),
+    Buffer.from(hmac, "utf8")
+  );
+}
+
+/**
+ * ----------------------------------------
+ * GET /shopify/install
+ * ----------------------------------------
+ */
 router.get("/install", (req, res) => {
   const shop = req.query.shop as string;
   if (!shop) return res.status(400).send("Missing shop");
 
   const state = crypto.randomBytes(16).toString("hex");
+
   const redirectUri = `${process.env.APP_URL}/shopify/callback`;
 
   const installUrl =
-    `https://${shop}/admin/oauth/authorize` +
-    `?client_id=${process.env.SHOPIFY_API_KEY}` +
-    `&scope=${SCOPES}` +
-    `&redirect_uri=${redirectUri}` +
-    `&state=${state}`;
+    `https://${shop}/admin/oauth/authorize?` +
+    querystring.stringify({
+      client_id: process.env.SHOPIFY_API_KEY,
+      scope: SCOPES,
+      redirect_uri: redirectUri,
+      state,
+    });
 
   res.redirect(installUrl);
 });
 
-// 2️⃣ OAuth callback
+/**
+ * ----------------------------------------
+ * GET /shopify/callback
+ * ----------------------------------------
+ */
 router.get("/callback", async (req, res) => {
-  const { shop, code } = req.query as { shop: string; code: string };
+  const query = req.query as Record<string, string>;
+  const { shop, code } = query;
 
   if (!shop || !code) {
     return res.status(400).send("Invalid OAuth callback");
+  }
+
+  if (!verifyOAuthHmac(query)) {
+    return res.status(401).send("Invalid OAuth HMAC");
   }
 
   try {
@@ -46,13 +86,31 @@ router.get("/callback", async (req, res) => {
 
     const accessToken = tokenResponse.data.access_token;
 
-    // 🔐 Store per-shop token
-    storeTokens.set(shop, accessToken);
+    /**
+     * Persist token in DB
+     */
+    await setToken(shop, accessToken);
 
-    res.send("App installed successfully. You can close this tab.");
+    /**
+     * Register webhook
+     */
+    await registerOrdersCreateWebhook(
+      shop,
+      accessToken,
+      process.env.APP_URL!
+    );
+
+    return res.send(`
+      <html>
+        <body style="font-family: sans-serif;">
+          <h2>App installed successfully</h2>
+          <p>You can now close this window.</p>
+        </body>
+      </html>
+    `);
   } catch (err: any) {
     console.error(err?.response?.data || err);
-    res.status(500).send("OAuth failed");
+    return res.status(500).send("OAuth failed");
   }
 });
 

@@ -1,30 +1,23 @@
 import axios from "axios";
-import { getToken } from "../storeTokens";
+import { getToken } from "../services/shopTokenService";
 
 const API_VERSION = "2024-04";
 
-// export function getShopifyClient(shop: string) {
-//   const token = getToken(shop);
+export async function getShopifyClient(shop: string) {
+  let token: string | null = null;
 
-//   if (!token) {
-//     throw new Error(`No Shopify token for shop: ${shop}`);
-//   }
+  /**
+   * Local dev shortcut
+   */
+  if (process.env.NODE_ENV !== "production" && process.env.DEV_SHOP === shop) {
+    token = process.env.DEV_SHOPIFY_TOKEN ?? null;
+  }
 
-//   return axios.create({
-//     baseURL: `https://${shop}/admin/api/2024-04`,
-//     headers: {
-//       "X-Shopify-Access-Token": token,
-//       "Content-Type": "application/json",
-//     },
-//   });
-// }
-
-export function getShopifyClient(shop: string) {
-  let token = getToken(shop);
-
-  // 👇 DEV FALLBACK (LOCAL ONLY)
-  if (!token && process.env.DEV_SHOP === shop) {
-    token = process.env.DEV_SHOPIFY_TOKEN;
+  /**
+   * Production token from DB
+   */
+  if (!token) {
+    token = await getToken(shop);
   }
 
   if (!token) {
@@ -32,7 +25,7 @@ export function getShopifyClient(shop: string) {
   }
 
   return axios.create({
-    baseURL: `https://${shop}/admin/api/2024-04`,
+    baseURL: `https://${shop}/admin/api/${API_VERSION}`,
     headers: {
       "X-Shopify-Access-Token": token,
       "Content-Type": "application/json",

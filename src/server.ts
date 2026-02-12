@@ -3,53 +3,125 @@ dotenv.config();
 
 import express from "express";
 import cors from "cors";
-import { initDb, getPool } from "./db";
+import crypto from "crypto";
+import http from "http";
+
+import { getPool, closePool } from "./db";
 
 // Routes
 import authRoutes from "./routes/auth";
 import checkoutRoutes from "./routes/checkout";
 import shopifyAuthRoutes from "./routes/shopifyAuth";
 import shopifyRoutes from "./routes/shopify";
+import refundRoutes from "./routes/refund";
 
 // Webhooks
 import shopifyWebhooks from "./shopify/webhooks";
 import razorpayWebhooks from "./routes/razorpayWebhook";
 
 // Jobs
+import { reconcileRazorpayPayments } from "./jobs/razorpayReconcile";
+import { replayFailedWebhooks } from "./jobs/replayFailedWebhooks";
+import { reconcileCheckouts } from "./jobs/reconcileCheckouts";
+import { cleanupExpiredOtps } from "./jobs/otpCleanup";
 import { expireStaleCheckouts } from "./jobs/checkoutTimeout";
+import { reconcileRefunds } from "./jobs/refundReconcile";
 
 const app = express();
-const PORT = Number(process.env.PORT) || 4000;
+let server: http.Server;
+const intervals: NodeJS.Timeout[] = [];
 
-/**
- * Global crash guards
- */
-process.on("unhandledRejection", (reason) => {
-  console.error("🚨 UNHANDLED PROMISE REJECTION", reason);
+/* ======================================================
+   Request ID + Logging
+====================================================== */
+
+app.use((req, res, next) => {
+  const requestId = crypto.randomUUID();
+  (req as any).requestId = requestId;
+  res.setHeader("X-Request-Id", requestId);
+
+  const start = Date.now();
+
+  res.on("finish", () => {
+    console.log(
+      JSON.stringify({
+        event: "http_request",
+        requestId,
+        method: req.method,
+        path: req.originalUrl,
+        status: res.statusCode,
+        durationMs: Date.now() - start,
+      })
+    );
+  });
+
+  next();
 });
 
-process.on("uncaughtException", (err) => {
-  console.error("🚨 UNCAUGHT EXCEPTION", err);
+/* ======================================================
+   Crash Guards (Non-Fatal Network)
+====================================================== */
+
+process.on("uncaughtException", (err: any) => {
+  console.error("🚨 UNCAUGHT EXCEPTION:", err?.message);
+
+  if (
+    err?.code === "ETIMEDOUT" ||
+    err?.code === "ECONNRESET" ||
+    err?.code === "EADDRNOTAVAIL"
+  ) {
+    return; // do not crash
+  }
+
+  process.exit(1);
 });
 
-/**
- * Boot sequence (STRICT ORDER)
- */
+process.on("unhandledRejection", (reason: any) => {
+  console.error("🚨 UNHANDLED PROMISE:", reason?.message);
+});
+
+/* ======================================================
+   Guarded Background Jobs (Calm + No DB Reset Storm)
+====================================================== */
+
+function guardedInterval(fn: () => Promise<void>, ms: number) {
+  let running = false;
+
+  const t = setInterval(async () => {
+    if (running) return;
+    running = true;
+
+    try {
+      await fn();
+    } catch (err: any) {
+      console.error("⚠️ Background job error:", err?.message);
+      // Do NOT reset pool
+      // Do NOT re-init DB
+    } finally {
+      running = false;
+    }
+  }, ms);
+
+  intervals.push(t);
+}
+
+/* ======================================================
+   Boot
+====================================================== */
+
 async function startServer() {
-  // 1️⃣ Init DB FIRST
-  await initDb();
+  // Simple DB test
+  await getPool().query("SELECT 1");
 
-  // 2️⃣ Middleware
   app.use(
     cors({
-      origin: "http://localhost:5173",
+      origin: process.env.FRONTEND_URL,
       credentials: true,
     })
   );
 
-  /**
-   * WEBHOOKS — RAW BODY FIRST
-   */
+  /* ---------- Webhooks FIRST ---------- */
+
   app.use(
     "/webhooks/razorpay",
     express.raw({ type: "application/json" }),
@@ -62,52 +134,74 @@ async function startServer() {
     shopifyWebhooks
   );
 
-  /**
-   * NORMAL JSON ROUTES
-   */
+  /* ---------- JSON Routes ---------- */
+
   app.use(express.json());
 
   app.use("/auth", authRoutes);
   app.use("/checkout", checkoutRoutes);
   app.use("/shopify", shopifyAuthRoutes);
   app.use("/shopify", shopifyRoutes);
+  app.use("/payments", refundRoutes);
 
-  /**
-   * HEALTH
-   */
-  app.get("/health", (_, res) => {
-    res.json({ status: "ok" });
-  });
+  /* ---------- Health ---------- */
+
+  app.get("/health", (_, res) => res.json({ status: "ok" }));
 
   app.get("/db-health", async (_, res) => {
     try {
-      const pool = getPool();
-      await pool.query("SELECT 1");
+      await getPool().query("SELECT 1");
       res.json({ ok: true });
-    } catch (err) {
-      console.error("DB health failed:", err);
+    } catch {
       res.status(500).json({ ok: false });
     }
   });
 
-  /**
-   * 3️⃣ START SERVER (ONCE)
-   */
-  app.listen(PORT, () => {
+  /* ---------- Express Error Handler ---------- */
+
+  app.use((err: any, _req: any, res: any, _next: any) => {
+    console.error("Unhandled express error:", err?.message);
+    res.status(500).json({ error: "Internal server error" });
+  });
+
+  const PORT = Number(process.env.PORT) || 4000;
+
+  server = app.listen(PORT, () => {
     console.log(`🚀 Server running on port ${PORT}`);
   });
 
-  /**
-   * 4️⃣ START BACKGROUND JOBS (AFTER DB)
-   */
-  setInterval(() => {
-    expireStaleCheckouts().catch((err) =>
-      console.error("❌ Background job error:", err)
-    );
-  }, 30_000);
+  /* ======================================================
+     BACKGROUND JOBS (SLOWER + SAFE)
+  ====================================================== */
+
+  // Minimal background jobs (optional)
+// Run rarely to reduce DB churn
+
+// guardedInterval(cleanupExpiredOtps, 600_000);      // 10 minutes
+// guardedInterval(expireStaleCheckouts, 600_000);   // 10 minutes
 }
 
-startServer().catch((err) => {
-  console.error("❌ Failed to start server", err);
+startServer().catch(async (err) => {
+  console.error("❌ Failed to start server:", err?.message);
+  await closePool();
   process.exit(1);
 });
+
+/* ======================================================
+   Graceful Shutdown
+====================================================== */
+
+async function shutdown(signal: string) {
+  console.log(`🛑 ${signal} received. Shutting down...`);
+
+  server.close(async () => {
+    intervals.forEach(clearInterval);
+    await closePool();
+    process.exit(0);
+  });
+
+  setTimeout(() => process.exit(1), 15000);
+}
+
+process.on("SIGTERM", () => shutdown("SIGTERM"));
+process.on("SIGINT", () => shutdown("SIGINT"));

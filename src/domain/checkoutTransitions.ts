@@ -1,7 +1,8 @@
 import { CheckoutStep } from "./checkoutStates";
 
 const allowedTransitions: Record<CheckoutStep, CheckoutStep[]> = {
-  PHONE_ENTERED: [CheckoutStep.OTP_VERIFIED],
+  PHONE_ENTERED: [CheckoutStep.OTP_SENT],
+  OTP_SENT: [CheckoutStep.OTP_VERIFIED],
   OTP_VERIFIED: [CheckoutStep.ADDRESS_SAVED],
   ADDRESS_SAVED: [CheckoutStep.PAYMENT_INITIATED],
   PAYMENT_INITIATED: [CheckoutStep.COMPLETED, CheckoutStep.FAILED],
