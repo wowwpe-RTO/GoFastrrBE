@@ -16,9 +16,9 @@ router.post("/", async (req, res) => {
     return res.status(200).send("OK");
   }
 
-  const secret = process.env.SHOPIFY_WEBHOOK_SECRET;
+  const secret = process.env.SHOPIFY_CLIENT_SECRET;
   if (!secret) {
-    console.error("❌ SHOPIFY_WEBHOOK_SECRET missing");
+    console.error("❌ SHOPIFY_CLIENT_SECRET missing");
     return res.status(500).send("Server misconfigured");
   }
 
@@ -96,13 +96,13 @@ if (!safeCompare(hmacHeader.trim(), generatedHmac.trim())) {
        4️⃣ LOG + OPTIONAL BACKFILL
     ====================================================== */
 
-    if (payload?.id) {
-      console.log("📦 Shopify order.created received", {
-        shop,
-        orderId: payload.id,
-        orderName: payload.name,
-      });
-    }
+    // if (payload?.id) {
+    //   console.log("📦 Shopify order.created received", {
+    //     shop,
+    //     orderId: payload.id,
+    //     orderName: payload.name,
+    //   });
+    // }
 
     return res.status(200).send("OK");
   } catch (err: any) {

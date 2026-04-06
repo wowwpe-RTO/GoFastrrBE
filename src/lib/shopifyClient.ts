@@ -1,7 +1,7 @@
 import axios from "axios";
 import { getToken } from "../services/shopTokenService";
 
-const API_VERSION = "2024-04";
+const API_VERSION = "2025-01";
 
 export async function getShopifyClient(shop: string) {
   let token: string | null = null;

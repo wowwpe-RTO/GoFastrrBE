@@ -9,28 +9,19 @@ import axios from "axios";
 import { CheckoutStep } from "../domain/checkoutStates";
 import { assertTransition } from "../domain/checkoutTransitions";
 import { registerOrdersCreateWebhook } from "../shopify/createWebhook";
-import { setToken, getToken } from "../services/shopTokenService";
+import { setToken } from "../services/shopTokenService";
 
 const router = Router();
 
-/**
- * OTP send schema (cart locked here)
- */
-const otpSendSchema = z.object({
-  phone: z.string().trim().regex(/^\d{6,15}$/),
-  shop: z.string().trim().regex(/^[a-z0-9.-]+\.myshopify\.com$/),
-  discountCode: z.string().optional(),
-  lineItems: z
-    .array(
-      z.object({
-        variantId: z.number().int().positive(),
-        quantity: z.number().int().min(1).max(10),
-      })
-    )
-    .min(1)
-    .max(10),
-});
+/* ======================================================
+   SCHEMAS
+====================================================== */
 
+const otpSendSchema = z.object({
+  checkoutSessionId: z.string().uuid(),
+  phone: z.string().trim().regex(/^\d{10}$/),
+  shop: z.string(),
+});
 
 const otpVerifySchema = z.object({
   checkoutSessionId: z.string().uuid(),
@@ -41,11 +32,10 @@ function hashOtp(otp: string) {
   return crypto.createHash("sha256").update(otp).digest("hex");
 }
 
-/**
- * ----------------------------------------
- * POST /auth/otp/send
- * ----------------------------------------
- */
+/* ======================================================
+   POST /auth/otp/send
+====================================================== */
+
 router.post("/otp/send", otpLimiter, async (req, res) => {
   const pool = getPool();
   const parsed = otpSendSchema.safeParse(req.body);
@@ -57,194 +47,50 @@ router.post("/otp/send", otpLimiter, async (req, res) => {
     });
   }
 
-  const { phone, shop, lineItems, discountCode } = parsed.data;
-
+  const { checkoutSessionId, phone } = parsed.data;
   const client = await pool.connect();
 
   try {
     await client.query("BEGIN");
 
-    // OTP Rate limit
-    const recent = await client.query(
-      `
-      SELECT count(*)
-      FROM otp_codes
-      WHERE phone = $1
-        AND created_at > now() - interval '10 minutes'
-      `,
-      [phone]
+    const sessionResult = await client.query(
+      `SELECT step FROM checkout_sessions
+       WHERE id = $1
+       FOR UPDATE`,
+      [checkoutSessionId]
     );
 
-    if (Number(recent.rows[0].count) >= 3) {
+    if (!sessionResult.rowCount) {
       await client.query("ROLLBACK");
-      return res.status(429).json({
-        error: "Too many OTP requests",
-        code: "OTP_RATE_LIMIT",
-      });
+      return res.status(404).json({ error: "Session not found" });
     }
 
-    const accessToken = await getToken(shop);
-    if (!accessToken) {
+    const currentStep = sessionResult.rows[0].step;
+
+    if (
+      currentStep !== CheckoutStep.CART &&
+      currentStep !== CheckoutStep.OTP_SENT
+    ) {
       await client.query("ROLLBACK");
-      return res.status(400).json({ error: "Shop not installed" });
+      return res.status(400).json({ error: "Invalid checkout state" });
     }
 
-    // Create session
-    const checkoutResult = await client.query(
-      `
-      INSERT INTO checkout_sessions (
-        shop,
-        phone,
-        step,
-        currency,
-        created_at,
-        updated_at
-      )
-      VALUES ($1,$2,$3,'INR',now(),now())
-      RETURNING id
-      `,
-      [shop, phone, CheckoutStep.PHONE_ENTERED]
-    );
-
-    const checkoutSessionId = checkoutResult.rows[0].id;
-
-    // Build subtotal
-    let subtotal = 0;
-
-    for (const item of lineItems) {
-      const variantResp = await axios.get(
-        `https://${shop}/admin/api/2025-10/variants/${item.variantId}.json`,
-        {
-          headers: { "X-Shopify-Access-Token": accessToken },
-        }
-      );
-
-      const variant = variantResp.data.variant;
-      if (!variant?.price) throw new Error("Invalid variant");
-
-      const unitPrice = Math.round(Number(variant.price) * 100);
-      const lineTotal = unitPrice * item.quantity;
-
-      subtotal += lineTotal;
-
-      await client.query(
-        `
-        INSERT INTO checkout_line_items
-        (checkout_session_id, variant_id, quantity, unit_price_paise, title)
-        VALUES ($1,$2,$3,$4,$5)
-        `,
-        [
-          checkoutSessionId,
-          item.variantId,
-          item.quantity,
-          unitPrice,
-          variant.title,
-        ]
-      );
-    }
-
-    /**
-     * DISCOUNT VALIDATION (Shopify Price Rules)
-     */
-    let discountAmount = 0;
-
-    if (discountCode) {
-      const discountResp = await axios.get(
-        `https://${shop}/admin/api/2025-10/discount_codes/lookup.json?code=${discountCode}`,
-        { headers: { "X-Shopify-Access-Token": accessToken } }
-      );
-
-      const discount = discountResp.data.discount_code;
-
-      if (discount) {
-        const ruleResp = await axios.get(
-          `https://${shop}/admin/api/2025-10/price_rules/${discount.price_rule_id}.json`,
-          { headers: { "X-Shopify-Access-Token": accessToken } }
-        );
-
-        const rule = ruleResp.data.price_rule;
-
-        if (rule.value_type === "percentage") {
-          discountAmount = Math.round(
-            subtotal * (Math.abs(Number(rule.value)) / 100)
-          );
-        }
-
-        if (rule.value_type === "fixed_amount") {
-          discountAmount = Math.abs(Math.round(Number(rule.value) * 100));
-        }
-      }
-    }
-
-    /**
-     * TAX + SHIPPING SETTINGS
-     */
-    const settingsResult = await client.query(
-      `
-      SELECT tax_rate, free_shipping_threshold, default_shipping_rate
-      FROM shop_settings
-      WHERE shop = $1
-      `,
-      [shop]
-    );
-
-    const settings = settingsResult.rows[0] || {
-      tax_rate: 0,
-      free_shipping_threshold: 500000,
-      default_shipping_rate: 5000,
-    };
-
-    const taxableAmount = subtotal - discountAmount;
-
-    const taxAmount = Math.round(
-      taxableAmount * Number(settings.tax_rate)
-    );
-
-    const shippingAmount =
-      taxableAmount >= Number(settings.free_shipping_threshold)
-        ? 0
-        : Number(settings.default_shipping_rate);
-
-    const total =
-      taxableAmount + taxAmount + shippingAmount;
-
-    // Persist breakdown
     await client.query(
-      `
-      UPDATE checkout_sessions
-      SET
-        subtotal_amount = $1,
-        discount_code = $2,
-        discount_amount = $3,
-        shipping_amount = $4,
-        tax_amount = $5,
-        total_amount = $6,
-        step = $7,
-        updated_at = now()
-      WHERE id = $8
-      `,
-      [
-        subtotal,
-        discountCode || null,
-        discountAmount,
-        shippingAmount,
-        taxAmount,
-        total,
-        CheckoutStep.OTP_SENT,
-        checkoutSessionId,
-      ]
+      `UPDATE checkout_sessions
+       SET phone = $1,
+           step = $2,
+           updated_at = now()
+       WHERE id = $3`,
+      [phone, CheckoutStep.OTP_SENT, checkoutSessionId]
     );
 
-    // OTP
     const otp = crypto.randomInt(1000, 10000).toString();
     const otpHash = hashOtp(otp);
 
     await client.query(
-      `
-      INSERT INTO otp_codes
-      (phone, otp_hash, checkout_session_id, attempts, expires_at)
-      VALUES ($1,$2,$3,0, now() + interval '5 minutes')
-      `,
+      `INSERT INTO otp_codes
+       (phone, otp_hash, checkout_session_id, attempts, expires_at)
+       VALUES ($1,$2,$3,0, now() + interval '5 minutes')`,
       [phone, otpHash, checkoutSessionId]
     );
 
@@ -254,14 +100,8 @@ router.post("/otp/send", otpLimiter, async (req, res) => {
       console.log(`OTP for ${phone}: ${otp}`);
     }
 
-    return res.json({
-      checkoutSessionId,
-      subtotal,
-      discountAmount,
-      shippingAmount,
-      taxAmount,
-      total,
-    });
+    return res.json({ checkoutSessionId });
+
   } catch (err) {
     await client.query("ROLLBACK");
     console.error("OTP send failed:", err);
@@ -271,18 +111,99 @@ router.post("/otp/send", otpLimiter, async (req, res) => {
   }
 });
 
+/* ======================================================
+   POST /auth/otp/resend
+   Re-sends OTP for an existing OTP_SENT session.
+   Rate-limited. Reuses same phone already on session.
+====================================================== */
 
-
-
-/**
- * ----------------------------------------
- * POST /auth/otp/verify
- * ----------------------------------------
- */
-router.post("/otp/verify", otpLimiter, async (req, res) => {
+router.post("/otp/resend", otpLimiter, async (req, res) => {
   const pool = getPool();
 
+  const schema = z.object({
+    checkoutSessionId: z.string().uuid(),
+  });
+
+  const parsed = schema.safeParse(req.body);
+
+  if (!parsed.success) {
+    return res.status(400).json({ error: "Invalid input" });
+  }
+
+  const { checkoutSessionId } = parsed.data;
+  const client = await pool.connect();
+
+  try {
+    await client.query("BEGIN");
+
+    const sessionResult = await client.query(
+      `SELECT step, phone FROM checkout_sessions
+       WHERE id = $1
+       FOR UPDATE`,
+      [checkoutSessionId]
+    );
+
+    if (!sessionResult.rowCount) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ error: "Session not found" });
+    }
+
+    const { step, phone } = sessionResult.rows[0];
+
+    if (step !== CheckoutStep.OTP_SENT) {
+      await client.query("ROLLBACK");
+      return res.status(400).json({ error: "Invalid checkout state for resend" });
+    }
+
+    if (!phone) {
+      await client.query("ROLLBACK");
+      return res.status(400).json({ error: "No phone on session" });
+    }
+
+    // Invalidate all existing unconsumed OTPs for this session
+    await client.query(
+      `UPDATE otp_codes
+       SET consumed_at = now()
+       WHERE checkout_session_id = $1
+         AND consumed_at IS NULL`,
+      [checkoutSessionId]
+    );
+
+    const otp = crypto.randomInt(1000, 10000).toString();
+    const otpHash = hashOtp(otp);
+
+    await client.query(
+      `INSERT INTO otp_codes
+       (phone, otp_hash, checkout_session_id, attempts, expires_at)
+       VALUES ($1,$2,$3,0, now() + interval '5 minutes')`,
+      [phone, otpHash, checkoutSessionId]
+    );
+
+    await client.query("COMMIT");
+
+    if (process.env.NODE_ENV !== "production") {
+      console.log(`Resent OTP for ${phone}: ${otp}`);
+    }
+
+    return res.json({ success: true });
+
+  } catch (err) {
+    await client.query("ROLLBACK");
+    console.error("OTP resend failed:", err);
+    return res.status(500).json({ error: "OTP resend failed" });
+  } finally {
+    client.release();
+  }
+});
+
+/* ======================================================
+   POST /auth/otp/verify
+====================================================== */
+
+router.post("/otp/verify", otpLimiter, async (req, res) => {
+  const pool = getPool();
   const parsed = otpVerifySchema.safeParse(req.body);
+
   if (!parsed.success) {
     return res.status(400).json({ error: "Invalid input" });
   }
@@ -295,11 +216,11 @@ router.post("/otp/verify", otpLimiter, async (req, res) => {
   try {
     await client.query("BEGIN");
 
-    /**
-     * Lock checkout session
-     */
     const sessionResult = await client.query(
-      `SELECT step FROM checkout_sessions WHERE id = $1 FOR UPDATE`,
+      `SELECT step, phone
+       FROM checkout_sessions
+       WHERE id = $1
+       FOR UPDATE`,
       [checkoutSessionId]
     );
 
@@ -308,18 +229,16 @@ router.post("/otp/verify", otpLimiter, async (req, res) => {
       return res.status(404).json({ error: "Checkout session not found" });
     }
 
-    const currentStep = sessionResult.rows[0].step;
+    const currentStep = sessionResult.rows[0].step as CheckoutStep;
+    const phone: string | null = sessionResult.rows[0].phone;
 
-    if (currentStep === CheckoutStep.OTP_VERIFIED) {
+    if (currentStep === CheckoutStep.ADDRESS_SAVED) {
       await client.query("COMMIT");
       return res.json({ success: true, checkoutSessionId });
     }
 
     assertTransition(currentStep, CheckoutStep.OTP_VERIFIED);
 
-    /**
-     * Lock OTP row
-     */
     const otpRow = await client.query(
       `
       SELECT id, attempts
@@ -336,29 +255,17 @@ router.post("/otp/verify", otpLimiter, async (req, res) => {
 
     if (!otpRow.rowCount) {
       await client.query("ROLLBACK");
-      return res.status(401).json({
-        error: "OTP expired",
-        code: "OTP_EXPIRED",
-      });
+      return res.status(401).json({ error: "OTP expired" });
     }
 
     const otpRecord = otpRow.rows[0];
 
-    /**
-     * Too many attempts
-     */
     if (Number(otpRecord.attempts) >= 5) {
       await client.query("COMMIT");
-      return res.status(429).json({
-        error: "Too many failed attempts",
-        code: "OTP_LOCKED",
-      });
+      return res.status(429).json({ error: "Too many attempts" });
     }
 
-    /**
-     * Validate OTP
-     */
-    const validOtpResult = await client.query(
+    const validOtp = await client.query(
       `
       SELECT id
       FROM otp_codes
@@ -370,54 +277,124 @@ router.post("/otp/verify", otpLimiter, async (req, res) => {
       [otpRecord.id, otpHash]
     );
 
-    if (!validOtpResult.rowCount) {
-      /**
-       * Increment attempt count
-       */
+    if (!validOtp.rowCount) {
       await client.query(
-        `
-        UPDATE otp_codes
-        SET attempts = attempts + 1
-        WHERE id = $1
-        `,
+        `UPDATE otp_codes
+         SET attempts = attempts + 1
+         WHERE id = $1`,
         [otpRecord.id]
       );
 
       await client.query("COMMIT");
-
-      return res.status(401).json({
-        error: "Invalid OTP",
-        code: "OTP_INVALID",
-      });
+      return res.status(401).json({ error: "Invalid OTP" });
     }
 
-    /**
-     * Mark consumed
-     */
     await client.query(
-      `
-      UPDATE otp_codes
-      SET consumed_at = now()
-      WHERE id = $1
-      `,
+      `UPDATE otp_codes
+       SET consumed_at = now()
+       WHERE id = $1`,
       [otpRecord.id]
     );
 
-    /**
-     * Advance checkout step
-     */
-    await client.query(
-      `
-      UPDATE checkout_sessions
-      SET step = $1, updated_at = now()
-      WHERE id = $2
-      `,
-      [CheckoutStep.OTP_VERIFIED, checkoutSessionId]
-    );
+    let nextStep: CheckoutStep = CheckoutStep.OTP_VERIFIED;
+    let previousAddresses: any[] = [];
+
+    if (phone) {
+      const previous = await client.query(
+        `
+        SELECT
+          shipping_address,
+          email,
+          created_at
+        FROM checkout_sessions
+        WHERE phone = $1
+          AND shipping_address IS NOT NULL
+          AND id <> $2
+        ORDER BY created_at DESC
+        `,
+        [phone, checkoutSessionId]
+      );
+
+      if (previous.rowCount && previous.rows.length > 0) {
+        // Use most recent address as the session default
+        const mostRecent = await client.query(
+          `
+          SELECT shipping_address, email
+          FROM checkout_sessions
+          WHERE phone = $1
+            AND shipping_address IS NOT NULL
+            AND id <> $2
+          ORDER BY created_at DESC
+          LIMIT 1
+          `,
+          [phone, checkoutSessionId]
+        );
+
+        const savedAddress = mostRecent.rows[0].shipping_address;
+
+        await client.query(
+          `
+          UPDATE checkout_sessions
+          SET shipping_address = $1,
+              step = $2,
+              updated_at = now()
+          WHERE id = $3
+          `,
+          [savedAddress, CheckoutStep.ADDRESS_SAVED, checkoutSessionId]
+        );
+
+        nextStep = CheckoutStep.ADDRESS_SAVED;
+
+        // Deduplicate in JS — keep most recent per unique line1+postalCode combination
+        const seen = new Set<string>();
+        previousAddresses = previous.rows
+          .reduce((acc: any[], r: any) => {
+            const addr = typeof r.shipping_address === "string"
+              ? JSON.parse(r.shipping_address)
+              : r.shipping_address;
+            const key = `${(addr.line1 || "").toLowerCase().trim()}|${(addr.postalCode || "").trim()}`;
+            if (!seen.has(key)) {
+              seen.add(key);
+              acc.push({ ...addr, email: r.email });
+            }
+            return acc;
+          }, []);
+
+        console.log(
+          `Returning user ${phone}: found ${previousAddresses.length} unique address(es)`
+        );
+      } else {
+        await client.query(
+          `
+          UPDATE checkout_sessions
+          SET step = $1,
+              updated_at = now()
+          WHERE id = $2
+          `,
+          [CheckoutStep.OTP_VERIFIED, checkoutSessionId]
+        );
+      }
+    } else {
+      await client.query(
+        `
+        UPDATE checkout_sessions
+        SET step = $1,
+            updated_at = now()
+        WHERE id = $2
+        `,
+        [CheckoutStep.OTP_VERIFIED, checkoutSessionId]
+      );
+    }
 
     await client.query("COMMIT");
 
-    return res.json({ success: true, checkoutSessionId });
+    return res.json({
+      success: true,
+      checkoutSessionId,
+      step: nextStep,
+      previousAddresses,
+    });
+
   } catch (err) {
     await client.query("ROLLBACK");
     console.error("OTP verify failed:", err);
@@ -427,9 +404,60 @@ router.post("/otp/verify", otpLimiter, async (req, res) => {
   }
 });
 
-/**
- * Shopify OAuth unchanged
- */
+/* ======================================================
+   POST /auth/otp/edit
+====================================================== */
+
+router.post("/otp/edit", async (req, res) => {
+  const { checkoutSessionId } = req.body;
+  const pool = getPool();
+
+  if (!checkoutSessionId) {
+    return res.status(400).json({ error: "Missing session id" });
+  }
+
+  try {
+    // Guard: never reset a completed or partially paid session
+    const check = await pool.query(
+      `SELECT step, shopify_order_id FROM checkout_sessions WHERE id = $1`,
+      [checkoutSessionId]
+    );
+
+    if (!check.rowCount) {
+      return res.status(404).json({ error: "Session not found" });
+    }
+
+    const { step, shopify_order_id } = check.rows[0];
+
+    if (
+      step === CheckoutStep.COMPLETED ||
+      step === CheckoutStep.PARTIALLY_PAID ||
+      shopify_order_id
+    ) {
+      return res.status(400).json({ error: "Cannot edit a completed order" });
+    }
+
+    await pool.query(
+      `
+      UPDATE checkout_sessions
+      SET step = $1,
+          updated_at = now()
+      WHERE id = $2
+      `,
+      [CheckoutStep.CART, checkoutSessionId]
+    );
+
+    return res.json({ success: true });
+  } catch (err) {
+    console.error("OTP edit failed:", err);
+    return res.status(500).json({ error: "Failed to edit phone" });
+  }
+});
+
+/* ======================================================
+   SHOPIFY OAUTH
+====================================================== */
+
 function verifyOAuthHmac(query: Record<string, string>) {
   const { hmac, ...rest } = query;
   if (!hmac) return false;
@@ -455,7 +483,7 @@ router.get("/install", (req, res) => {
     querystring.stringify({
       client_id: process.env.SHOPIFY_CLIENT_ID,
       scope: process.env.SHOPIFY_SCOPES,
-      redirect_uri: `${process.env.APP_URL}/auth/callback`,
+      redirect_uri: `${process.env.APP_URL}/shopify/callback`,
       state,
     });
 
@@ -486,9 +514,9 @@ router.get("/callback", async (req, res) => {
 
     return res.send("<h2>Installed. You may close this window.</h2>");
   } catch (err: any) {
-  console.error("OAuth callback failed FULL:", err?.response?.data || err);
-  return res.status(500).json(err?.response?.data || err);
-}
+    console.error("OAuth callback failed:", err?.response?.data || err);
+    return res.status(500).json(err?.response?.data || err);
+  }
 });
 
 export default router;

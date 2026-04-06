@@ -8,7 +8,7 @@ import { registerOrdersCreateWebhook } from "../shopify/createWebhook";
 const router = Router();
 
 const SCOPES =
-  "read_customers,write_draft_orders,read_products,read_orders,write_orders,write_customers";
+  "read_customers,write_draft_orders,read_products,read_orders,write_orders,write_customers,read_files,read_themes";
 
 /**
  * ----------------------------------------
@@ -22,7 +22,7 @@ function verifyOAuthHmac(query: Record<string, string>) {
   const message = querystring.stringify(rest);
 
   const generated = crypto
-    .createHmac("sha256", process.env.SHOPIFY_API_SECRET!)
+    .createHmac("sha256", process.env.SHOPIFY_CLIENT_SECRET!)
     .update(message)
     .digest("hex");
 
@@ -43,12 +43,15 @@ router.get("/install", (req, res) => {
 
   const state = crypto.randomBytes(16).toString("hex");
 
-  const redirectUri = `${process.env.APP_URL}/shopify/callback`;
+  const appUrl = (process.env.APP_URL || "").replace(/\/$/, "");
+  const redirectUri = `${appUrl}/shopify/callback`;
+
+  console.log(`[shopifyAuth] Installing for ${shop}, redirect_uri: ${redirectUri}`);
 
   const installUrl =
     `https://${shop}/admin/oauth/authorize?` +
     querystring.stringify({
-      client_id: process.env.SHOPIFY_API_KEY,
+      client_id: process.env.SHOPIFY_CLIENT_ID,
       scope: SCOPES,
       redirect_uri: redirectUri,
       state,
@@ -78,8 +81,8 @@ router.get("/callback", async (req, res) => {
     const tokenResponse = await axios.post(
       `https://${shop}/admin/oauth/access_token`,
       {
-        client_id: process.env.SHOPIFY_API_KEY,
-        client_secret: process.env.SHOPIFY_API_SECRET,
+        client_id: process.env.SHOPIFY_CLIENT_ID,
+        client_secret: process.env.SHOPIFY_CLIENT_SECRET,
         code,
       }
     );

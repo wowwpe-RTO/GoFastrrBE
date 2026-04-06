@@ -3,6 +3,7 @@ import { CheckoutStep } from "../domain/checkoutStates";
 import { assertTransition } from "../domain/checkoutTransitions";
 import { createShopifyOrder } from "../shopify/createOrder";
 import { verifyShopifyOrder } from "../shopify/verifyOrder";
+import { completeDraftOrder } from "../shopify/completeDraftOrder";
 import { sendAlert } from "../services/alertService";
 import crypto from "crypto";
 
@@ -48,7 +49,7 @@ export async function handleRazorpayCapturedEvent({
     await client.query("BEGIN");
 
     /* ======================================================
-       1️⃣ Lock payment
+       1️⃣ LOCK PAYMENT
     ====================================================== */
 
     const paymentRes = await client.query(
@@ -58,7 +59,8 @@ export async function handleRazorpayCapturedEvent({
         checkout_session_id,
         amount_paise::bigint,
         captured_amount_paise::bigint,
-        currency
+        currency,
+        is_partial
       FROM payments
       WHERE gateway='razorpay'
         AND gateway_order_id=$1
@@ -78,9 +80,17 @@ export async function handleRazorpayCapturedEvent({
       throw new Error("Currency mismatch");
     }
 
-    const capturedDelta = toPaiseBigInt(safePaymentReference.amount);
-    const alreadyCaptured = toPaiseBigInt(payment.captured_amount_paise);
-    const orderTotal = toPaiseBigInt(payment.amount_paise);
+    const capturedDelta = toPaiseBigInt(
+      safePaymentReference.amount
+    );
+
+    const alreadyCaptured = toPaiseBigInt(
+      payment.captured_amount_paise
+    );
+
+    const orderTotal = toPaiseBigInt(
+      payment.amount_paise
+    );
 
     // Idempotency
     if (capturedDelta <= alreadyCaptured) {
@@ -89,6 +99,8 @@ export async function handleRazorpayCapturedEvent({
     }
 
     const newCaptured = alreadyCaptured + capturedDelta;
+
+    const paymentFullyCompleted = newCaptured === orderTotal;
 
     if (newCaptured > orderTotal) {
       throw new Error("Over-capture detected");
@@ -114,24 +126,20 @@ export async function handleRazorpayCapturedEvent({
       ]
     );
 
-    // Stop on partial capture
-    if (newCaptured !== orderTotal) {
-      await client.query("COMMIT");
-      return;
-    }
-
     const checkoutSessionId: string =
       payment.checkout_session_id;
 
     /* ======================================================
-       2️⃣ Lock checkout
+       2️⃣ LOCK CHECKOUT
     ====================================================== */
 
     const sessionRes = await client.query(
       `
       SELECT
         step,
+        shop,
         shopify_order_id,
+        shopify_draft_order_id,
         cart_items,
         subtotal_amount,
         shipping_amount,
@@ -151,21 +159,47 @@ export async function handleRazorpayCapturedEvent({
     }
 
     const session = sessionRes.rows[0];
+    const isPartial = payment.is_partial === true;
 
-    // Already completed → idempotent
-    if (session.step === CheckoutStep.COMPLETED) {
+    /* ======================================================
+       3️⃣ PARTIAL PAYMENT FLOW
+    ====================================================== */
+
+    if (isPartial) {
+      if (session.step === CheckoutStep.COMPLETED) {
+        await client.query("COMMIT");
+        return;
+      }
+
+      assertTransition(
+        session.step,
+        CheckoutStep.PARTIALLY_PAID
+      );
+
+      await client.query(
+        `
+        UPDATE checkout_sessions
+        SET step=$1,
+            updated_at=now()
+        WHERE id=$2
+        `,
+        [CheckoutStep.PARTIALLY_PAID, checkoutSessionId]
+      );
+
       await client.query("COMMIT");
+
+      // Outside transaction → create draft
+      if (!session.shopify_draft_order_id) {
+        await createShopifyOrder(checkoutSessionId, {
+          mode: "draft",
+        });
+      }
+
       return;
     }
 
-    // Must come from PAYMENT_INITIATED
-    assertTransition(
-      session.step,
-      CheckoutStep.COMPLETED
-    );
-
     /* ======================================================
-       3️⃣ Cart integrity check
+       4️⃣ FULL PAYMENT INTEGRITY CHECK
     ====================================================== */
 
     const recomputedHash = crypto
@@ -194,7 +228,7 @@ export async function handleRazorpayCapturedEvent({
           event: "cart_integrity_violation",
           checkoutSessionId,
           message:
-            "Cart hash mismatch during capture",
+            "Cart hash mismatch during full capture",
         });
 
         throw new Error("Cart integrity violation");
@@ -202,13 +236,24 @@ export async function handleRazorpayCapturedEvent({
     }
 
     /* ======================================================
-       4️⃣ Move state → COMPLETED
+       5️⃣ FULL PAYMENT FLOW
     ====================================================== */
+
+    if (session.step === CheckoutStep.COMPLETED) {
+      await client.query("COMMIT");
+      return;
+    }
+
+    assertTransition(
+      session.step,
+      CheckoutStep.COMPLETED
+    );
 
     await client.query(
       `
       UPDATE checkout_sessions
-      SET step=$1, updated_at=now()
+      SET step=$1,
+          updated_at=now()
       WHERE id=$2
       `,
       [CheckoutStep.COMPLETED, checkoutSessionId]
@@ -216,22 +261,53 @@ export async function handleRazorpayCapturedEvent({
 
     await client.query("COMMIT");
 
-    /* ======================================================
-       5️⃣ OUTSIDE TRANSACTION → Create Shopify order
-    ====================================================== */
-
     if (!session.shopify_order_id) {
-      const order = await createShopifyOrder(
-        checkoutSessionId
-      );
 
-      if (order?.id) {
-        await verifyShopifyOrder({
+      if (session.shopify_draft_order_id) {
+
+        const order = await completeDraftOrder(
+          session.shop,
+          session.shopify_draft_order_id
+        );
+
+        if (order?.order_id) {
+          await verifyShopifyOrder({
+            checkoutSessionId,
+            shopifyOrderId: order.order_id,
+          });
+        }
+
+      } else {
+
+      const order = await createShopifyOrder(
           checkoutSessionId,
-          shopifyOrderId: order.id,
+          { mode: "final" }
+        ).catch(async (err) => {
+          // Shopify order creation failed AFTER payment was captured and
+          // step was committed to COMPLETED. Do NOT re-throw — that would
+          // be a no-op since the transaction is already committed.
+          // Alert ops and let the reconcile job retry.
+          console.error("createShopifyOrder failed after COMPLETED:", err?.message || err);
+          await sendAlert({
+            level: "critical",
+            event: "shopify_order_creation_failed",
+            checkoutSessionId,
+            message: "Shopify order creation failed after payment captured. Reconcile job will retry.",
+            meta: { error: err?.message, response: err?.response?.data },
+          });
+          return null;
         });
+
+        if (order?.id) {
+          await verifyShopifyOrder({
+            checkoutSessionId,
+            shopifyOrderId: order.id,
+          });
+        }
+
       }
     }
+
   } catch (err) {
     await client.query("ROLLBACK");
     throw err;

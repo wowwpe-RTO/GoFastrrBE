@@ -6,10 +6,10 @@ export function verifyShopifyWebhook(
 ): boolean {
   if (!hmacHeader) return false;
 
-  const secret = process.env.SHOPIFY_WEBHOOK_SECRET;
+  const secret = process.env.SHOPIFY_CLIENT_SECRET;
 
   if (!secret) {
-    console.error("❌ SHOPIFY_WEBHOOK_SECRET is missing");
+    console.error("❌ SHOPIFY_CLIENT_SECRET is missing");
     return false;
   }
 

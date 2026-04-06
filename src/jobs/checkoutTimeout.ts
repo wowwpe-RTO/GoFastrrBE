@@ -37,7 +37,7 @@ export async function expireStaleCheckouts(limit = 50) {
       `,
       [
         CheckoutStep.FAILED,
-        CheckoutStep.PAYMENT_INITIATED,
+        CheckoutStep.COMPLETED,
         CheckoutStep.ADDRESS_SAVED,
         limit,
       ]

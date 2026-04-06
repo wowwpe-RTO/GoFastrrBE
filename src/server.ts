@@ -15,6 +15,8 @@ import shopifyAuthRoutes from "./routes/shopifyAuth";
 import shopifyRoutes from "./routes/shopify";
 import refundRoutes from "./routes/refund";
 
+import checkoutPreview from "./routes/checkoutPreview";
+
 // Webhooks
 import shopifyWebhooks from "./shopify/webhooks";
 import razorpayWebhooks from "./routes/razorpayWebhook";
@@ -70,7 +72,7 @@ process.on("uncaughtException", (err: any) => {
     err?.code === "ECONNRESET" ||
     err?.code === "EADDRNOTAVAIL"
   ) {
-    return; // do not crash
+    return;
   }
 
   process.exit(1);
@@ -81,7 +83,7 @@ process.on("unhandledRejection", (reason: any) => {
 });
 
 /* ======================================================
-   Guarded Background Jobs (Calm + No DB Reset Storm)
+   Guarded Background Jobs
 ====================================================== */
 
 function guardedInterval(fn: () => Promise<void>, ms: number) {
@@ -95,8 +97,6 @@ function guardedInterval(fn: () => Promise<void>, ms: number) {
       await fn();
     } catch (err: any) {
       console.error("⚠️ Background job error:", err?.message);
-      // Do NOT reset pool
-      // Do NOT re-init DB
     } finally {
       running = false;
     }
@@ -110,7 +110,6 @@ function guardedInterval(fn: () => Promise<void>, ms: number) {
 ====================================================== */
 
 async function startServer() {
-  // Simple DB test
   await getPool().query("SELECT 1");
 
   app.use(
@@ -134,17 +133,52 @@ async function startServer() {
     shopifyWebhooks
   );
 
+  /* ======================================================
+     NEW: Draft Order Webhook
+  ====================================================== */
+
+  app.post(
+    "/webhooks/draft_orders/create",
+    express.raw({ type: "application/json" }),
+    async (req, res) => {
+      try {
+        const body = JSON.parse(req.body.toString());
+
+        console.log(
+          "📦 Shopify draft order created:",
+          body?.id
+        );
+
+        res.status(200).send("ok");
+      } catch (err: any) {
+        console.error(
+          "Draft order webhook error:",
+          err?.message
+        );
+        res.status(200).send("ok");
+      }
+    }
+  );
+
   /* ---------- JSON Routes ---------- */
 
   app.use(express.json());
 
   app.use("/auth", authRoutes);
   app.use("/checkout", checkoutRoutes);
+  app.use("/checkout", checkoutPreview);
   app.use("/shopify", shopifyAuthRoutes);
   app.use("/shopify", shopifyRoutes);
   app.use("/payments", refundRoutes);
 
   /* ---------- Health ---------- */
+
+  app.get("/debug/sessions", async (_, res) => {
+    const r = await getPool().query(
+      "SELECT id FROM checkout_sessions ORDER BY created_at DESC LIMIT 5"
+    );
+    res.json(r.rows);
+  });
 
   app.get("/health", (_, res) => res.json({ status: "ok" }));
 
@@ -155,6 +189,39 @@ async function startServer() {
     } catch {
       res.status(500).json({ ok: false });
     }
+  });
+
+  /* ---------- Root — handles Shopify embedded redirect ---------- */
+  app.get("/", (req, res) => {
+    const shop = req.query.shop as string;
+    const host = req.query.host as string;
+
+    if (!shop) {
+      // No shop param — show install form
+      return res.send(`
+        <html><body style="font-family:sans-serif;padding:40px;max-width:400px;margin:auto">
+          <h2>Wowwpe Checkout</h2>
+          <p>Enter your store to install:</p>
+          <form method="GET" action="/shopify/install">
+            <input name="shop" placeholder="yourstore.myshopify.com"
+              style="padding:10px;width:100%;box-sizing:border-box;margin-bottom:10px;border:1px solid #ccc;border-radius:6px" required />
+            <button type="submit"
+              style="padding:10px 20px;background:#0B7E63;color:white;border:none;border-radius:6px;cursor:pointer;width:100%">
+              Install App
+            </button>
+          </form>
+        </body></html>
+      `);
+    }
+
+    // Has shop + host — embedded load after OAuth, redirect to Shopify admin
+    if (host) {
+      const adminBase = Buffer.from(host, "base64").toString("utf8");
+      return res.redirect(`https://${adminBase}/apps/${process.env.SHOPIFY_CLIENT_ID}`);
+    }
+
+    // Has shop but no host — trigger OAuth
+    return res.redirect(`/shopify/install?shop=${shop}`);
   });
 
   /* ---------- Express Error Handler ---------- */
@@ -171,14 +238,11 @@ async function startServer() {
   });
 
   /* ======================================================
-     BACKGROUND JOBS (SLOWER + SAFE)
+     BACKGROUND JOBS
   ====================================================== */
 
-  // Minimal background jobs (optional)
-// Run rarely to reduce DB churn
-
-// guardedInterval(cleanupExpiredOtps, 600_000);      // 10 minutes
-// guardedInterval(expireStaleCheckouts, 600_000);   // 10 minutes
+  // guardedInterval(cleanupExpiredOtps, 600_000);
+  // guardedInterval(expireStaleCheckouts, 600_000);
 }
 
 startServer().catch(async (err) => {

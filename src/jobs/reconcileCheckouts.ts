@@ -41,9 +41,35 @@ export async function reconcileCheckouts() {
     LIMIT 20
   `);
 
-  if (!stuck.rowCount) return;
+  /**
+   * Also find sessions that ARE completed but have no Shopify order yet.
+   * This happens when createShopifyOrder throws after the step is committed.
+   */
+  const missingOrder = await pool.query(`
+    SELECT
+      cs.id AS checkout_session_id,
+      cs.step,
+      cs.shopify_order_id
+    FROM checkout_sessions cs
+    JOIN payments p
+      ON p.checkout_session_id = cs.id
+    WHERE
+      p.gateway = 'razorpay'
+      AND p.status = 'CAPTURED'
+      AND cs.step = '${CheckoutStep.COMPLETED}'
+      AND cs.shopify_order_id IS NULL
+      AND cs.updated_at < now() - interval '2 minutes'
+    LIMIT 20
+  `);
 
-  for (const row of stuck.rows) {
+  const allRows = [
+    ...(stuck.rows || []),
+    ...(missingOrder.rows || []),
+  ];
+
+  if (!allRows.length) return;
+
+  for (const row of allRows) {
     const checkoutSessionId = row.checkout_session_id;
 
     try {
@@ -69,12 +95,13 @@ export async function reconcileCheckouts() {
 
       const session = locked.rows[0];
 
-      if (session.step === CheckoutStep.COMPLETED) {
+      let shopifyOrderId = session.shopify_order_id;
+
+      // Already completed AND has order — nothing to do
+      if (session.step === CheckoutStep.COMPLETED && shopifyOrderId) {
         await pool.query("COMMIT");
         continue;
       }
-
-      let shopifyOrderId = session.shopify_order_id;
 
       /**
        * Create Shopify order if missing
@@ -93,7 +120,7 @@ export async function reconcileCheckouts() {
       });
 
       /**
-       * Finalize checkout
+       * Finalize checkout — only update step if not already COMPLETED
        */
       await pool.query(
         `
