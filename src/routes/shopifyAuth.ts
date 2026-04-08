@@ -94,6 +94,28 @@ router.get("/callback", async (req, res) => {
      */
     await setToken(shop, accessToken);
 
+    try {
+  await axios.post(
+    `https://${shop}/admin/api/2024-01/script_tags.json`,
+    {
+      script_tag: {
+        event: "onload",
+        src: `${process.env.APP_URL}/script.js`,
+      },
+    },
+    {
+      headers: {
+        "X-Shopify-Access-Token": accessToken,
+        "Content-Type": "application/json",
+      },
+    }
+  );
+
+  console.log("✅ Script injected");
+} catch (err: any) {
+  console.error("⚠️ Script injection failed:", err?.response?.data || err.message);
+}
+
     /**
      * Register webhook
      */

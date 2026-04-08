@@ -1,6 +1,6 @@
 import dotenv from "dotenv";
 dotenv.config();
-
+import path from "path";
 import express from "express";
 import cors from "cors";
 import crypto from "crypto";
@@ -173,6 +173,11 @@ async function startServer() {
   app.use("/shopify", shopifyAuthRoutes);
   app.use("/shopify", shopifyRoutes);
   app.use("/payments", refundRoutes);
+
+  app.get("/script.js", (req, res) => {
+  res.setHeader("Content-Type", "application/javascript");
+  res.sendFile(path.join(__dirname, "../public/script.js"));
+});
 
   /* ---------- Health ---------- */
 
