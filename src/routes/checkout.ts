@@ -57,8 +57,6 @@ router.post("/start", async (req, res) => {
   const client = await pool.connect();
 const token = await getToken(shop);
 
-console.log("TOKEN LENGTH:", token?.length);
-console.log("TOKEN PREVIEW:", token?.slice(0, 10));
   try {
     await client.query("BEGIN");
 
@@ -953,35 +951,33 @@ router.get("/redirect", async (req, res) => {
       return res.status(400).send("Missing params");
     }
 
-    const sessionId = crypto.randomUUID();
-    const pool = getPool();
-
-    // Create session
-    await pool.query(
-      `INSERT INTO checkout_sessions (id, shop, step, currency)
-       VALUES ($1, $2, 'CART', 'INR')`,
-      [sessionId, shop]
+    // 🔥 IMPORTANT: call your existing /start endpoint internally
+    const startResponse = await axios.post(
+      `${process.env.APP_URL}/checkout/start`,
+      {
+        shop,
+        lineItems: [
+          {
+            variantId: Number(variantId),
+            quantity: Number(quantity || 1),
+          },
+        ],
+      }
     );
 
-    // Add item
-    await pool.query(
-      `INSERT INTO checkout_line_items
-       (checkout_session_id, variant_id, quantity)
-       VALUES ($1, $2, $3)`,
-      [sessionId, variantId, quantity || 1]
-    );
+    const sessionId = startResponse.data.checkoutSessionId;
 
-    // Redirect to frontend
     return res.redirect(
       `https://checkout.wowwpe.io/checkout?session=${sessionId}&shop=${shop}`
     );
 
   } catch (err: any) {
-  console.error("Redirect error FULL:", err);
-  return res.status(500).json({
-    error: err?.message || "Unknown error",
-  });
-}
+    console.error("Redirect error FULL:", err?.response?.data || err.message);
+    return res.status(500).json({
+      error: err?.response?.data || err?.message || "Unknown error",
+    });
+  }
 });
+
 
 export default router;
