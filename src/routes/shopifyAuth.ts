@@ -112,9 +112,13 @@ router.get("/callback", async (req, res) => {
       </html>
     `);
   } catch (err: any) {
-    console.error(err?.response?.data || err);
-    return res.status(500).send("OAuth failed");
-  }
+  console.error("🔥 FULL ERROR:", err);
+  console.error("🔥 RESPONSE:", err?.response?.data);
+
+  return res.status(500).send(`
+    <pre>${JSON.stringify(err?.response?.data || err.message, null, 2)}</pre>
+  `);
+}
 });
 
 export default router;
