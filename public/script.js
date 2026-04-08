@@ -36,11 +36,20 @@
 
     if (!btn) return;
 
+    console.log('Clicked:', btn.innerText, btn);
+
     if (
-      btn.innerText.toLowerCase().includes('checkout') ||
+      btn.innerText.toLowerCase().includes('check') ||
+      btn.type === 'submit' ||
+      btn.name === 'checkout' ||
+      btn.getAttribute('formaction')?.includes('/checkout') ||
       btn.href?.includes('/checkout')
     ) {
       e.preventDefault();
+      e.stopPropagation();
+
+      console.log('INTERCEPTED CHECKOUT');
+
       startCheckout();
     }
   });
