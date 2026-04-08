@@ -23,16 +23,16 @@
     overlay.style.zIndex = '2147483646';
 
     // Modal container (FULL VIEWPORT FEEL)
-    // const modal = document.createElement('div');
-    // modal.style.position = 'fixed';
-    // modal.style.top = '0';
-    // modal.style.left = '0';
-    // modal.style.width = '100vw';
-    // modal.style.height = '100vh';
-    // modal.style.display = 'flex';
-    // modal.style.alignItems = 'center';
-    // modal.style.justifyContent = 'center';
-    // modal.style.zIndex = '2147483647';
+    const modal = document.createElement('div');
+    modal.style.position = 'fixed';
+    modal.style.top = '0';
+    modal.style.left = '0';
+    modal.style.width = '100vw';
+    modal.style.height = '100vh';
+    modal.style.display = 'flex';
+    modal.style.alignItems = 'center';
+    modal.style.justifyContent = 'center';
+    modal.style.zIndex = '2147483647';
 
     // Inner frame (this is your "card")
     const container = document.createElement('div');
