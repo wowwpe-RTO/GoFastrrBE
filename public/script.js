@@ -56,10 +56,14 @@
 
     document.body.appendChild(overlay);
     document.body.appendChild(modal);
+    document.body.style.overflow = 'hidden';
 
     overlay.onclick = () => {
       modal.remove();
       overlay.remove();
+
+      // 🔥 restore scroll
+      document.body.style.overflow = '';
     };
   }
   /**
