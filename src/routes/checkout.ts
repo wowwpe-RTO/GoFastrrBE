@@ -43,19 +43,32 @@ const payInitSchema = z.object({
 ====================================================== */
 
 router.post("/start", async (req, res) => {
-  const { shop, lineItems } = req.body;
+  const { shop } = req.body;
+
+const lineItems = (req.body.lineItems || []).map((item: any) => ({
+  variantId: item.variantId || item.variant_id,
+  quantity: item.quantity,
+}));
+
+
   const pool = getPool();
 
   if (!shop || !Array.isArray(lineItems) || !lineItems.length) {
     return res.status(400).json({ error: "Invalid payload" });
   }
 
+  for (const item of lineItems) {
+  if (!item.variantId) {
+    return res.status(400).json({ error: "Missing variantId" });
+  }
+}
+
   console.log("SHOP:", shop);
 
 
 
   const client = await pool.connect();
-const token = await getToken(shop);
+let token = await getToken(shop);
 
   try {
     await client.query("BEGIN");
@@ -976,9 +989,13 @@ router.get("/redirect", async (req, res) => {
     let subtotal = 0;
 
     const item = {
-      variantId: Number(variantId),
-      quantity: Number(quantity || 1),
-    };
+  variantId: Number(variantId),
+  quantity: Number(quantity || 1),
+};
+
+if (!item.variantId) {
+  throw new Error("Missing variantId");
+}
 
     const variantRes = await axios.get(
       `https://${shop}/admin/api/2025-01/variants/${item.variantId}.json`,
