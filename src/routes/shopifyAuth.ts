@@ -8,7 +8,7 @@ import { registerOrdersCreateWebhook } from "../shopify/createWebhook";
 const router = Router();
 
 const SCOPES =
-  "read_customers,write_draft_orders,read_products,read_orders,write_orders,write_customers,read_files,read_themes";
+  "read_customers,write_draft_orders,read_products,read_inventory,read_orders,write_orders,write_customers,read_files,read_themes";
 
 /**
  * ----------------------------------------
