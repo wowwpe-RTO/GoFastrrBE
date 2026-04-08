@@ -11,49 +11,57 @@
   function openWowwpeModal(sessionId, shop) {
     console.log('🧩 Opening Wowwpe modal');
 
-    // Overlay
+    // Overlay (transparent blur effect)
     const overlay = document.createElement('div');
     overlay.style.position = 'fixed';
     overlay.style.top = '0';
     overlay.style.left = '0';
-    overlay.style.width = '100%';
-    overlay.style.height = '100%';
-    overlay.style.background = 'rgba(0,0,0,0.4)';
+    overlay.style.width = '100vw';
+    overlay.style.height = '100vh';
+    overlay.style.background = 'rgba(0,0,0,0.25)'; // lighter
+    overlay.style.backdropFilter = 'blur(4px)';
     overlay.style.zIndex = '2147483646';
 
-    // Modal container
+    // Modal container (FULL VIEWPORT FEEL)
     const modal = document.createElement('div');
     modal.style.position = 'fixed';
-    modal.style.top = '50%';
-    modal.style.left = '50%';
-    modal.style.transform = 'translate(-50%, -50%)';
-    modal.style.width = '90%';
-    modal.style.maxWidth = '1000px';
-    modal.style.height = '90%';
-    modal.style.background = '#fff';
-    modal.style.borderRadius = '12px';
-    modal.style.overflow = 'hidden';
+    modal.style.top = '0';
+    modal.style.left = '0';
+    modal.style.width = '100vw';
+    modal.style.height = '100vh';
+    modal.style.display = 'flex';
+    modal.style.alignItems = 'center';
+    modal.style.justifyContent = 'center';
     modal.style.zIndex = '2147483647';
-    modal.style.boxShadow = '0 20px 60px rgba(0,0,0,0.3)';
 
-    // Iframe
+    // Inner frame (this is your "card")
+    const container = document.createElement('div');
+    container.style.width = '95%';
+    container.style.height = '95%';
+    container.style.maxWidth = '1200px';
+    container.style.borderRadius = '16px';
+    container.style.overflow = 'hidden';
+    container.style.background = '#fff';
+    container.style.boxShadow = '0 30px 80px rgba(0,0,0,0.4)';
+
+    // iframe
     const iframe = document.createElement('iframe');
     iframe.src = `https://checkout.wowwpe.io/checkout?session=${sessionId}&shop=${shop}`;
     iframe.style.width = '100%';
     iframe.style.height = '100%';
     iframe.style.border = 'none';
 
-    modal.appendChild(iframe);
+    container.appendChild(iframe);
+    modal.appendChild(container);
+
     document.body.appendChild(overlay);
     document.body.appendChild(modal);
 
-    // Close on overlay click
     overlay.onclick = () => {
       modal.remove();
       overlay.remove();
     };
   }
-
   /**
    * ========================================
    * 🚀 START CHECKOUT
