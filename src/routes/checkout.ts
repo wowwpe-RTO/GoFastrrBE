@@ -976,10 +976,12 @@ router.get("/redirect", async (req, res) => {
       `https://checkout.wowwpe.io/checkout?session=${sessionId}&shop=${shop}`
     );
 
-  } catch (err) {
-    console.error("Redirect error:", err);
-    return res.status(500).send("Error creating checkout");
-  }
+  } catch (err: any) {
+  console.error("Redirect error FULL:", err);
+  return res.status(500).json({
+    error: err?.message || "Unknown error",
+  });
+}
 });
 
 export default router;
