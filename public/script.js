@@ -33,22 +33,37 @@
   // Intercept checkout buttons
   document.addEventListener('click', function (e) {
     const btn = e.target.closest('button, a');
-
     if (!btn) return;
 
-    console.log('Clicked:', btn.innerText, btn);
+    const text = btn.innerText?.toLowerCase() || '';
 
-    if (
-      btn.innerText.toLowerCase().includes('check') ||
-      btn.type === 'submit' ||
+    console.log('Clicked:', text, btn);
+
+    // ✅ DO NOT TOUCH add to cart
+    if (text.includes('add to cart')) {
+      return;
+    }
+
+    // ✅ HANDLE checkout buttons ONLY
+    const isCheckout =
+      text.includes('check out') ||
+      text.includes('checkout') ||
       btn.name === 'checkout' ||
+      btn.id?.toLowerCase().includes('checkout') ||
       btn.getAttribute('formaction')?.includes('/checkout') ||
-      btn.href?.includes('/checkout')
-    ) {
+      btn.href?.includes('/checkout');
+
+    // ✅ HANDLE buy it now
+    const isBuyNow =
+      text.includes('buy it now') ||
+      btn.getAttribute('data-testid')?.includes('buy-now');
+
+    if (isCheckout || isBuyNow) {
       e.preventDefault();
       e.stopPropagation();
+      e.stopImmediatePropagation();
 
-      console.log('INTERCEPTED CHECKOUT');
+      console.log('🚀 WOWWPE INTERCEPT');
 
       startCheckout();
     }
