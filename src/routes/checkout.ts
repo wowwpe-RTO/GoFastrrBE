@@ -944,38 +944,102 @@ router.post("/step/back", async (req, res) => {
 });
 
 router.get("/redirect", async (req, res) => {
-  try {
-    const { shop, variantId, quantity } = req.query;
+  const { shop, variantId, quantity } = req.query;
 
-    if (!shop || !variantId) {
-      return res.status(400).send("Missing params");
+  if (!shop || !variantId) {
+    return res.status(400).send("Missing params");
+  }
+
+  const pool = getPool();
+  const client = await pool.connect();
+
+  try {
+    await client.query("BEGIN");
+
+    let token = await getToken(shop as string);
+
+    if (!token && process.env.SHOPIFY_ADMIN_TOKEN) {
+      token = process.env.SHOPIFY_ADMIN_TOKEN;
     }
 
-    // 🔥 IMPORTANT: call your existing /start endpoint internally
-    const startResponse = await axios.post(
-      `${process.env.APP_URL}/checkout/start`,
-      {
-        shop,
-        lineItems: [
-          {
-            variantId: Number(variantId),
-            quantity: Number(quantity || 1),
-          },
-        ],
-      }
+    if (!token) throw new Error("Shop token missing");
+
+    const sessionResult = await client.query(
+      `INSERT INTO checkout_sessions (shop, step, subtotal_amount, currency)
+       VALUES ($1, $2, 0, 'INR')
+       RETURNING id`,
+      [shop, CheckoutStep.CART]
     );
 
-    const sessionId = startResponse.data.checkoutSessionId;
+    const sessionId = sessionResult.rows[0].id;
+
+    let subtotal = 0;
+
+    const item = {
+      variantId: Number(variantId),
+      quantity: Number(quantity || 1),
+    };
+
+    const variantRes = await axios.get(
+      `https://${shop}/admin/api/2025-01/variants/${item.variantId}.json`,
+      { headers: { "X-Shopify-Access-Token": token.trim() } }
+    );
+
+    const variant = variantRes.data?.variant;
+    if (!variant) throw new Error("Variant not found");
+
+    const productRes = await axios.get(
+      `https://${shop}/admin/api/2025-01/products/${variant.product_id}.json`,
+      { headers: { "X-Shopify-Access-Token": token.trim() } }
+    );
+
+    const product = productRes.data?.product;
+    if (!product) throw new Error("Product not found");
+
+    const pricePaise = Math.round(Number(variant.price) * 100);
+    const comparePrice = variant.compare_at_price
+      ? Math.round(Number(variant.compare_at_price) * 100)
+      : null;
+
+    subtotal += pricePaise * item.quantity;
+
+    await client.query(
+      `INSERT INTO checkout_line_items
+       (checkout_session_id, variant_id, quantity, unit_price_paise,
+        compare_at_price_paise, product_title, variant_title, image)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
+      [
+        sessionId,
+        variant.id,
+        item.quantity,
+        pricePaise,
+        comparePrice,
+        product.title,
+        variant.title !== "Default Title" ? variant.title : null,
+        product?.images?.[0]?.src || product?.image?.src || null,
+      ]
+    );
+
+    await client.query(
+      `UPDATE checkout_sessions
+       SET subtotal_amount = $1::numeric,
+           total_amount    = $1::numeric
+       WHERE id = $2`,
+      [subtotal, sessionId]
+    );
+
+    await client.query("COMMIT");
 
     return res.redirect(
       `https://checkout.wowwpe.io/checkout?session=${sessionId}&shop=${shop}`
     );
 
   } catch (err: any) {
-    console.error("Redirect error FULL:", err?.response?.data || err.message);
-    return res.status(500).json({
-      error: err?.response?.data || err?.message || "Unknown error",
-    });
+    await client.query("ROLLBACK");
+    console.error("Redirect error:", err);
+    return res.status(500).json({ error: err.message });
+  } finally {
+    client.release();
   }
 });
 
