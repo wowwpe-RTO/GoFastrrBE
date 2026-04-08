@@ -33,6 +33,18 @@ const app = express();
 let server: http.Server;
 const intervals: NodeJS.Timeout[] = [];
 
+
+
+app.use(
+  cors({
+    origin: "*", // 🔥 allow all for now (we'll tighten later)
+    methods: ["GET", "POST", "PUT", "DELETE"],
+    allowedHeaders: ["Content-Type", "Authorization"],
+  })
+);
+
+app.options("*", cors());
+
 /* ======================================================
    Request ID + Logging
 ====================================================== */
