@@ -116,6 +116,8 @@ router.get("/callback", async (req, res) => {
   console.error("⚠️ Script injection failed:", err?.response?.data || err.message);
 }
 
+console.log("ACCESS TOKEN:", accessToken);
+
     /**
      * Register webhook
      */
