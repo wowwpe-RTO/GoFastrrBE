@@ -30,18 +30,18 @@
     modal.style.width = '100vw';
     modal.style.height = '100vh';
     modal.style.display = 'flex';
-    modal.style.alignItems = 'center';
-    modal.style.justifyContent = 'center';
+    // modal.style.alignItems = 'center';
+    // modal.style.justifyContent = 'center';
     modal.style.zIndex = '2147483647';
 
     // Inner frame (this is your "card")
     const container = document.createElement('div');
-    container.style.width = '95%';
+    container.style.width = '100%';
     container.style.height = '95%';
-    container.style.maxWidth = '1200px';
-    container.style.borderRadius = '16px';
+    // container.style.maxWidth = '1200px';
+    container.style.borderRadius = '1px';
     container.style.overflow = 'hidden';
-    container.style.background = '#fff';
+    // container.style.background = '#fff';
     container.style.boxShadow = '0 30px 80px rgba(0,0,0,0.4)';
 
     // iframe
