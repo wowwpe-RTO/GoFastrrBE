@@ -97,20 +97,26 @@ router.get("/callback", async (req, res) => {
     /**
      * Register webhook
      */
-    await registerOrdersCreateWebhook(
-      shop,
-      accessToken,
-      process.env.APP_URL!
-    );
+    try {
+  await registerOrdersCreateWebhook(
+    shop,
+    accessToken,
+    process.env.APP_URL!
+  );
+  console.log("✅ Webhook registered");
+} catch (err: any) {
+  console.error("⚠️ Webhook failed:", err?.response?.data || err.message);
+  // DO NOT throw
+}
 
-    return res.send(`
-      <html>
-        <body style="font-family: sans-serif;">
-          <h2>App installed successfully</h2>
-          <p>You can now close this window.</p>
-        </body>
-      </html>
-    `);
+   return res.send(`
+  <html>
+    <body style="font-family: sans-serif;">
+      <h2>App installed successfully 🚀</h2>
+      <p>You can now close this window.</p>
+    </body>
+  </html>
+`);
   } catch (err: any) {
   console.error("🔥 FULL ERROR:", err);
   console.error("🔥 RESPONSE:", err?.response?.data);
