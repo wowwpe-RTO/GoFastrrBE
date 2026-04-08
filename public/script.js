@@ -37,7 +37,7 @@
     // Inner frame (this is your "card")
     const container = document.createElement('div');
     container.style.width = '100%';
-    container.style.height = '95%';
+    container.style.height = '100%';
     // container.style.maxWidth = '1200px';
     container.style.borderRadius = '1px';
     container.style.overflow = 'hidden';
