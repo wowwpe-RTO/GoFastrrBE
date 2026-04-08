@@ -163,10 +163,10 @@ if (!token) {
 
   } catch (err: any) {
     await client.query("ROLLBACK");
-    console.error("Checkout start failed:", err);
+    console.error("🔥 FULL ERROR:", err?.response?.data || err.message || err);
     return res.status(500).json({
-      error: err.message || "Checkout start failed",
-    });
+    error: err?.response?.data || err.message || "Unknown error"
+  });
   } finally {
     client.release();
   }

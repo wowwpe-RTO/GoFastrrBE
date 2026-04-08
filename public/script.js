@@ -52,6 +52,39 @@
     }
   }
 
+  // Intercept checkout buttons
+  document.addEventListener(
+    'click',
+    function (e) {
+      const btn = e.target.closest('button, a');
+
+      if (!btn) return;
+
+      const text = btn.innerText?.toLowerCase() || '';
+
+      const isCheckout =
+        text.includes('checkout') ||
+        btn.name === 'checkout' ||
+        btn.id?.includes('checkout');
+
+      const isBuyNow =
+        text.includes('buy it now') || btn.innerText?.includes('Buy it now');
+
+      if (isCheckout || isBuyNow) {
+        console.log('🚀 HARD INTERCEPT', btn);
+
+        e.preventDefault();
+        e.stopPropagation();
+        e.stopImmediatePropagation();
+
+        startCheckout();
+
+        return false;
+      }
+    },
+    true,
+  ); // 👈 CAPTURE PHASE (VERY IMPORTANT)
+
   document.addEventListener('submit', function (e) {
     const form = e.target;
 
@@ -68,42 +101,34 @@
     }
   });
 
-  // Intercept checkout buttons
-  document.addEventListener('click', function (e) {
-    const btn = e.target.closest('button, a');
-    if (!btn) return;
+  const originalAssign = window.location.assign;
 
-    const text = btn.innerText?.toLowerCase() || '';
+  window.location.assign = function (url) {
+    if (url.includes('/checkout')) {
+      console.log('🚀 BLOCKED NAVIGATION TO SHOPIFY CHECKOUT');
 
-    console.log('Clicked:', text, btn);
-
-    // ✅ DO NOT TOUCH add to cart
-    if (text.includes('add to cart')) {
+      startCheckout();
       return;
     }
 
-    // ✅ HANDLE checkout buttons ONLY
-    const isCheckout =
-      text.includes('check out') ||
-      text.includes('checkout') ||
-      btn.name === 'checkout' ||
-      btn.id?.toLowerCase().includes('checkout') ||
-      btn.getAttribute('formaction')?.includes('/checkout') ||
-      btn.href?.includes('/checkout');
+    return originalAssign.call(this, url);
+  };
 
-    // ✅ HANDLE buy it now
-    const isBuyNow =
-      text.includes('buy it now') ||
-      btn.getAttribute('data-testid')?.includes('buy-now');
+  document.addEventListener(
+    'click',
+    function (e) {
+      const link = e.target.closest('a');
 
-    if (isCheckout || isBuyNow) {
-      e.preventDefault();
-      e.stopPropagation();
-      e.stopImmediatePropagation();
+      if (!link) return;
 
-      console.log('🚀 WOWWPE INTERCEPT');
+      if (link.href.includes('/checkout')) {
+        e.preventDefault();
 
-      startCheckout();
-    }
-  });
+        console.log('🚀 LINK CHECKOUT INTERCEPT');
+
+        startCheckout();
+      }
+    },
+    true,
+  );
 })();
