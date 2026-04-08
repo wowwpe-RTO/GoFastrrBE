@@ -3,11 +3,65 @@
 
   const shop = window.Shopify?.shop;
 
+  /**
+   * ========================================
+   * 🔥 MODAL (ADD THIS — TOP LEVEL)
+   * ========================================
+   */
+  function openWowwpeModal(sessionId, shop) {
+    console.log('🧩 Opening Wowwpe modal');
+
+    // Overlay
+    const overlay = document.createElement('div');
+    overlay.style.position = 'fixed';
+    overlay.style.top = '0';
+    overlay.style.left = '0';
+    overlay.style.width = '100%';
+    overlay.style.height = '100%';
+    overlay.style.background = 'rgba(0,0,0,0.4)';
+    overlay.style.zIndex = '2147483646';
+
+    // Modal container
+    const modal = document.createElement('div');
+    modal.style.position = 'fixed';
+    modal.style.top = '50%';
+    modal.style.left = '50%';
+    modal.style.transform = 'translate(-50%, -50%)';
+    modal.style.width = '90%';
+    modal.style.maxWidth = '1000px';
+    modal.style.height = '90%';
+    modal.style.background = '#fff';
+    modal.style.borderRadius = '12px';
+    modal.style.overflow = 'hidden';
+    modal.style.zIndex = '2147483647';
+    modal.style.boxShadow = '0 20px 60px rgba(0,0,0,0.3)';
+
+    // Iframe
+    const iframe = document.createElement('iframe');
+    iframe.src = `https://checkout.wowwpe.io/checkout?session=${sessionId}&shop=${shop}`;
+    iframe.style.width = '100%';
+    iframe.style.height = '100%';
+    iframe.style.border = 'none';
+
+    modal.appendChild(iframe);
+    document.body.appendChild(overlay);
+    document.body.appendChild(modal);
+
+    // Close on overlay click
+    overlay.onclick = () => {
+      modal.remove();
+      overlay.remove();
+    };
+  }
+
+  /**
+   * ========================================
+   * 🚀 START CHECKOUT
+   * ========================================
+   */
   async function startCheckout() {
     try {
       console.log('🔥 START CHECKOUT');
-
-      const shop = window.Shopify?.shop;
 
       const cartRes = await fetch('/cart.js');
       const cart = await cartRes.json();
@@ -22,6 +76,11 @@
 
       console.log('📦 LINE ITEMS:', lineItems);
 
+      if (!lineItems.length) {
+        console.warn('⚠️ Cart is empty');
+        return;
+      }
+
       const res = await fetch('https://api.wowwpe.io/checkout/start', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -35,15 +94,10 @@
       console.log('✅ RESPONSE DATA:', data);
 
       if (data.checkoutSessionId) {
-        const url =
-          'https://checkout.wowwpe.io/checkout?session=' +
-          data.checkoutSessionId +
-          '&shop=' +
-          shop;
+        console.log('🎯 OPENING MODAL INSTEAD OF REDIRECT');
 
-        console.log('➡️ REDIRECTING TO:', url);
-
-        window.location.href = url;
+        // ✅ THIS IS THE KEY CHANGE
+        openWowwpeModal(data.checkoutSessionId, shop);
       } else {
         console.error('❌ No session returned');
       }
@@ -52,7 +106,11 @@
     }
   }
 
-  // Intercept checkout buttons
+  /**
+   * ========================================
+   * 🧠 CLICK INTERCEPT (STRONG)
+   * ========================================
+   */
   document.addEventListener(
     'click',
     function (e) {
@@ -68,7 +126,9 @@
         btn.id?.includes('checkout');
 
       const isBuyNow =
-        text.includes('buy it now') || btn.innerText?.includes('Buy it now');
+        text.includes('buy it now') ||
+        btn.className?.toLowerCase().includes('buy') ||
+        btn.innerText?.includes('Buy it now');
 
       if (isCheckout || isBuyNow) {
         console.log('🚀 HARD INTERCEPT', btn);
@@ -83,24 +143,36 @@
       }
     },
     true,
-  ); // 👈 CAPTURE PHASE (VERY IMPORTANT)
+  );
 
-  document.addEventListener('submit', function (e) {
-    const form = e.target;
+  /**
+   * ========================================
+   * 🧠 FORM INTERCEPT
+   * ========================================
+   */
+  document.addEventListener(
+    'submit',
+    function (e) {
+      const form = e.target;
 
-    console.log('FORM SUBMIT:', form);
+      if (form.action && form.action.includes('/checkout')) {
+        console.log('🚀 FORM INTERCEPT');
 
-    if (form.action && form.action.includes('/checkout')) {
-      e.preventDefault();
-      e.stopPropagation();
-      e.stopImmediatePropagation();
+        e.preventDefault();
+        e.stopPropagation();
+        e.stopImmediatePropagation();
 
-      console.log('🚀 FORM INTERCEPT');
+        startCheckout();
+      }
+    },
+    true,
+  );
 
-      startCheckout();
-    }
-  });
-
+  /**
+   * ========================================
+   * 🧠 NAVIGATION BLOCK
+   * ========================================
+   */
   const originalAssign = window.location.assign;
 
   window.location.assign = function (url) {
@@ -114,6 +186,11 @@
     return originalAssign.call(this, url);
   };
 
+  /**
+   * ========================================
+   * 🧠 LINK INTERCEPT
+   * ========================================
+   */
   document.addEventListener(
     'click',
     function (e) {
@@ -121,11 +198,10 @@
 
       if (!link) return;
 
-      if (link.href.includes('/checkout')) {
-        e.preventDefault();
-
+      if (link.href && link.href.includes('/checkout')) {
         console.log('🚀 LINK CHECKOUT INTERCEPT');
 
+        e.preventDefault();
         startCheckout();
       }
     },
