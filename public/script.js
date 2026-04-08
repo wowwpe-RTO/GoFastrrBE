@@ -12,15 +12,15 @@
     console.log('🧩 Opening Wowwpe modal');
 
     // Overlay (transparent blur effect)
-    // const overlay = document.createElement('div');
-    // overlay.style.position = 'fixed';
-    // overlay.style.top = '0';
-    // overlay.style.left = '0';
-    // overlay.style.width = '100vw';
-    // overlay.style.height = '100vh';
-    // overlay.style.background = 'rgba(0,0,0,0.25)';
-    // overlay.style.backdropFilter = 'blur(4px)';
-    // overlay.style.zIndex = '2147483646';
+    const overlay = document.createElement('div');
+    overlay.style.position = 'fixed';
+    overlay.style.top = '0';
+    overlay.style.left = '0';
+    overlay.style.width = '100vw';
+    overlay.style.height = '100vh';
+    overlay.style.background = 'rgba(0,0,0,0.25)'; // lighter
+    overlay.style.backdropFilter = 'blur(4px)';
+    overlay.style.zIndex = '2147483646';
 
     // Modal container (FULL VIEWPORT FEEL)
     // const modal = document.createElement('div');
@@ -35,14 +35,14 @@
     // modal.style.zIndex = '2147483647';
 
     // Inner frame (this is your "card")
-    // const container = document.createElement('div');
-    // container.style.width = '95%';
-    // container.style.height = '95%';
-    // container.style.maxWidth = '1200px';
-    // container.style.borderRadius = '16px';
-    // container.style.overflow = 'hidden';
-    // container.style.background = '#fff';
-    // container.style.boxShadow = '0 30px 80px rgba(0,0,0,0.4)';
+    const container = document.createElement('div');
+    container.style.width = '95%';
+    container.style.height = '95%';
+    container.style.maxWidth = '1200px';
+    container.style.borderRadius = '16px';
+    container.style.overflow = 'hidden';
+    container.style.background = '#fff';
+    container.style.boxShadow = '0 30px 80px rgba(0,0,0,0.4)';
 
     // iframe
     const iframe = document.createElement('iframe');
