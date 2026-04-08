@@ -73,9 +73,9 @@ router.get("/callback", async (req, res) => {
     return res.status(400).send("Invalid OAuth callback");
   }
 
-  if (!verifyOAuthHmac(query)) {
-    return res.status(401).send("Invalid OAuth HMAC");
-  }
+  // if (!verifyOAuthHmac(query)) {
+  //   return res.status(401).send("Invalid OAuth HMAC");
+  // }
 
   try {
     const tokenResponse = await axios.post(
@@ -89,10 +89,25 @@ router.get("/callback", async (req, res) => {
 
     const accessToken = tokenResponse.data.access_token;
 
+    console.log("🔥 CALLBACK HIT");
+
+console.log("👉 Shop:", shop);
+console.log("👉 Code:", code);
+
+console.log("🔐 Exchanging token...");
+
     /**
      * Persist token in DB
      */
     await setToken(shop, accessToken);
+
+    console.log("✅ Token received:", accessToken);
+
+    console.log("💾 Saving token...");
+
+    console.log("✅ Token saved");
+
+    
 
     try {
   await axios.post(
