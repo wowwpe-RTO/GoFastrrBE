@@ -945,4 +945,41 @@ router.post("/step/back", async (req, res) => {
   }
 });
 
+router.get("/redirect", async (req, res) => {
+  try {
+    const { shop, variantId, quantity } = req.query;
+
+    if (!shop || !variantId) {
+      return res.status(400).send("Missing params");
+    }
+
+    const sessionId = crypto.randomUUID();
+    const pool = getPool();
+
+    // Create session
+    await pool.query(
+      `INSERT INTO checkout_sessions (id, shop, step, currency)
+       VALUES ($1, $2, 'CART', 'INR')`,
+      [sessionId, shop]
+    );
+
+    // Add item
+    await pool.query(
+      `INSERT INTO checkout_line_items
+       (checkout_session_id, variant_id, quantity)
+       VALUES ($1, $2, $3)`,
+      [sessionId, variantId, quantity || 1]
+    );
+
+    // Redirect to frontend
+    return res.redirect(
+      `https://checkout.wowwpe.io/checkout?session=${sessionId}&shop=${shop}`
+    );
+
+  } catch (err) {
+    console.error("Redirect error:", err);
+    return res.status(500).send("Error creating checkout");
+  }
+});
+
 export default router;

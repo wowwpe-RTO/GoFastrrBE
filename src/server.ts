@@ -113,11 +113,14 @@ async function startServer() {
   await getPool().query("SELECT 1");
 
   app.use(
-    cors({
-      origin: process.env.FRONTEND_URL,
-      credentials: true,
-    })
-  );
+  cors({
+    origin: [
+      "http://localhost:3000",
+      "https://checkout.wowwpe.io",
+    ],
+    credentials: true,
+  })
+);
 
   /* ---------- Webhooks FIRST ---------- */
 
