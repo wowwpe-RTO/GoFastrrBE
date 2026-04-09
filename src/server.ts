@@ -47,7 +47,16 @@ app.use(
   })
 );
 
-app.options("*", cors());
+app.options(
+  "*",
+  cors({
+    origin: [
+      "https://wowwpe-test-store.myshopify.com",
+      "https://checkout.wowwpe.io",
+    ],
+    credentials: true,
+  })
+);
 
 
 
