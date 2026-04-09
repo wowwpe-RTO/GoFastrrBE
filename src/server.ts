@@ -124,16 +124,17 @@ function guardedInterval(fn: () => Promise<void>, ms: number) {
 async function startServer() {
   await getPool().query("SELECT 1");
 
-  app.use(
+app.use(
   cors({
     origin: [
-      "http://localhost:3000",
       "https://checkout.wowwpe.io",
+      "https://wowwpe-test-store.myshopify.com",
     ],
+    methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+    allowedHeaders: ["Content-Type", "Authorization"],
     credentials: true,
   })
 );
-
   /* ---------- Webhooks FIRST ---------- */
 
   app.use(
