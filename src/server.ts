@@ -5,6 +5,7 @@ import express from "express";
 import cors from "cors";
 import crypto from "crypto";
 import http from "http";
+import axios from "axios";
 
 import { getPool, closePool } from "./db";
 
@@ -251,6 +252,19 @@ async function startServer() {
   server = app.listen(PORT, () => {
     console.log(`🚀 Server running on port ${PORT}`);
   });
+
+
+
+app.listen(PORT, async () => {
+  console.log(`🚀 Server running on port ${PORT}`);
+
+  try {
+    const ip = await axios.get("https://api.ipify.org?format=json");
+    console.log("🌍 SERVER IP:", ip.data);
+  } catch (err) {
+    console.error("Failed to fetch server IP");
+  }
+});
 
   /* ======================================================
      BACKGROUND JOBS
