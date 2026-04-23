@@ -22,6 +22,9 @@ function createPool(): Pool {
 
     keepAlive: true,
     keepAliveInitialDelayMillis: 5_000,
+
+    statement_timeout: 5000,
+  query_timeout: 5000,
   });
 
   /**

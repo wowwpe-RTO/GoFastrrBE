@@ -1,7 +1,7 @@
 import { Router } from "express";
-import axios from "axios";
-import { getToken } from "../services/shopTokenService";
 import { getPool } from "../db";
+
+// FIX #9: removed dead import `getToken` from shopTokenService — was never used
 
 const router = Router();
 
@@ -10,7 +10,6 @@ const router = Router();
 =============================== */
 
 router.post("/preview", async (req, res) => {
-
   const { checkoutSessionId } = req.body;
   const pool = getPool();
 
@@ -23,10 +22,8 @@ router.post("/preview", async (req, res) => {
   const client = await pool.connect();
 
   try {
-
     const items = await client.query(
-      `
-      SELECT
+      `SELECT
         variant_id,
         quantity,
         unit_price_paise,
@@ -34,10 +31,9 @@ router.post("/preview", async (req, res) => {
         product_title,
         variant_title,
         image
-      FROM checkout_line_items
-      WHERE checkout_session_id = $1
-      ORDER BY created_at ASC
-      `,
+       FROM checkout_line_items
+       WHERE checkout_session_id = $1
+       ORDER BY created_at ASC`,
       [checkoutSessionId]
     );
 
@@ -58,22 +54,16 @@ router.post("/preview", async (req, res) => {
     const previewItems: any[] = [];
 
     for (const item of items.rows) {
-
       subtotal += item.unit_price_paise * item.quantity;
 
       if (item.compare_at_price_paise) {
-        compareTotal +=
-          item.compare_at_price_paise *
-          item.quantity;
+        compareTotal += item.compare_at_price_paise * item.quantity;
       }
 
       previewItems.push(item);
     }
 
-    const discount =
-      compareTotal > subtotal
-        ? compareTotal - subtotal
-        : 0;
+    const discount = compareTotal > subtotal ? compareTotal - subtotal : 0;
 
     return res.json({
       items: previewItems,
@@ -85,17 +75,10 @@ router.post("/preview", async (req, res) => {
     });
 
   } catch (err) {
-
     console.error("Preview failed:", err);
-
-    return res.status(500).json({
-      error: "Preview failed",
-    });
-
+    return res.status(500).json({ error: "Preview failed" });
   } finally {
-
     client.release();
-
   }
 });
 
