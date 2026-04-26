@@ -1,12 +1,14 @@
 import { Router } from "express";
 import crypto from "crypto";
 import { handleRazorpayCapturedEvent } from "../services/razorpayHandler";
+import { handleRefundProcessed } from "../services/refundHandler";
 
 const router = Router();
 
 /**
- * Razorpay webhook
- * IMPORTANT: req.body MUST be raw Buffer
+ * Razorpay Webhook
+ * Mounted at /webhooks/razorpay
+ * IMPORTANT: req.body MUST be raw Buffer (configured in server.ts)
  */
 router.post("/", async (req, res) => {
   try {
@@ -18,41 +20,92 @@ router.post("/", async (req, res) => {
 
     const signature = req.headers["x-razorpay-signature"];
     if (!signature || typeof signature !== "string") {
-      return res.status(400).send("Missing signature");
+      // Always ACK to avoid retry storms
+      return res.status(200).send("OK");
     }
 
     /**
-     * 1️⃣ Verify signature
+     * 1️⃣ RAW BODY ONLY
      */
     const body = req.body as Buffer;
 
+    /**
+     * 2️⃣ Compute expected signature (hex)
+     */
     const expectedSignature = crypto
       .createHmac("sha256", secret)
       .update(body)
       .digest("hex");
 
-    if (signature !== expectedSignature) {
-      return res.status(401).send("Invalid signature");
-    }
-
     /**
-     * 2️⃣ Parse event
+     * 3️⃣ Timing-safe comparison
      */
-    const event = JSON.parse(body.toString("utf8"));
+    const sigBuf = Buffer.from(signature, "utf8");
+    const expBuf = Buffer.from(expectedSignature, "utf8");
 
-    if (event.event !== "payment.captured") {
-      return res.status(200).send("Ignored");
+    if (
+      sigBuf.length !== expBuf.length ||
+      !crypto.timingSafeEqual(sigBuf, expBuf)
+    ) {
+      console.error("❌ Invalid Razorpay webhook signature");
+
+      // IMPORTANT: ACK anyway
+      return res.status(200).send("OK");
     }
 
-    const payment = event.payload.payment.entity;
+    /**
+     * 4️⃣ Parse payload AFTER verification
+     */
+    let event: any;
+    try {
+      event = JSON.parse(body.toString("utf8"));
+    } catch {
+      console.error("❌ Razorpay webhook JSON parse failed");
+      return res.status(200).send("OK");
+    }
 
     /**
-     * 3️⃣ Build PCI-SAFE reference only
+     * =========================
+     * REFUND PROCESSED
+     * =========================
+     */
+    if (event.event === "refund.processed") {
+      const refund = event?.payload?.refund?.entity;
+
+      if (!refund?.id || !refund?.amount) {
+        console.error("❌ Razorpay refund payload missing fields");
+        return res.status(200).send("OK");
+      }
+
+      await handleRefundProcessed({
+        razorpayRefundId: refund.id,
+        amount: Number(refund.amount),
+      });
+
+      return res.status(200).send("OK");
+    }
+
+    /**
+     * Only care about captured payments
+     */
+    if (event.event !== "payment.captured") {
+      return res.status(200).send("OK");
+    }
+
+    const payment = event?.payload?.payment?.entity;
+
+    if (!payment?.id || !payment?.order_id) {
+      console.error("❌ Razorpay payload missing ids");
+      return res.status(200).send("OK");
+    }
+
+    /**
+     * Minimal safe reference (no secrets)
      */
     const safePaymentReference = {
       payment_id: payment.id,
       order_id: payment.order_id,
-      amount: payment.amount,
+      amount: Number(payment.amount),
       currency: payment.currency,
       status: payment.status,
       method: payment.method,
@@ -60,26 +113,21 @@ router.post("/", async (req, res) => {
     };
 
     /**
-     * 4️⃣ Delegate ALL business logic
+     * Delegate idempotent reconciliation to service layer
      */
     await handleRazorpayCapturedEvent({
       razorpayOrderId: payment.order_id,
       safePaymentReference,
     });
 
-    /**
-     * IMPORTANT:
-     * Always ACK Razorpay to prevent retry storms
-     */
     return res.status(200).send("OK");
   } catch (err) {
     console.error("❌ Razorpay webhook failed:", err);
 
     /**
-     * Still ACK.
-     * Replay handled via dead-letter queue / reconciliation.
+     * Always ACK to prevent Razorpay retry storms
      */
-    return res.status(200).send("Webhook received");
+    return res.status(200).send("OK");
   }
 });
 

@@ -2,32 +2,75 @@ import { Pool } from "pg";
 
 let pool: Pool | null = null;
 
-export async function initDb(retries = 5, delayMs = 2000) {
-  for (let attempt = 1; attempt <= retries; attempt++) {
-    try {
-      pool = new Pool({
-        connectionString: process.env.DATABASE_URL,
-        ssl: { rejectUnauthorized: false }
-      });
+function createPool(): Pool {
+  const p = new Pool({
+    connectionString: process.env.DATABASE_URL,
 
-      await pool.query("SELECT 1");
-      console.log("✅ Database connected");
+    ssl:
+      process.env.NODE_ENV === "production"
+        ? { rejectUnauthorized: false }
+        : false,
+
+    // 🔥 Reduced to prevent socket exhaustion
+    max: 5,
+
+    // Close idle clients faster
+    idleTimeoutMillis: 10_000,
+
+    // Faster fail on broken connection
+    connectionTimeoutMillis: 5_000,
+
+    keepAlive: true,
+    keepAliveInitialDelayMillis: 5_000,
+
+    statement_timeout: 5000,
+  query_timeout: 5000,
+  });
+
+  /**
+   * IMPORTANT:
+   * Do NOT destroy pool on transient errors.
+   * Just log.
+   */
+  p.on("error", (err: any) => {
+    console.error("⚠️ PG pool error (non-fatal):", err?.message);
+
+    // Ignore transient network errors
+    if (
+      err?.code === "ETIMEDOUT" ||
+      err?.code === "ECONNRESET" ||
+      err?.code === "EADDRNOTAVAIL"
+    ) {
       return;
-    } catch (err) {
-      console.error(`❌ DB connection failed (attempt ${attempt})`, err);
-
-      if (attempt === retries) {
-        throw err;
-      }
-
-      await new Promise((r) => setTimeout(r, delayMs));
     }
-  }
+
+    // Only log unexpected errors
+  });
+
+  return p;
 }
 
 export function getPool(): Pool {
   if (!pool) {
-    throw new Error("DB not initialized");
+    pool = createPool();
   }
+
   return pool;
+}
+
+/**
+ * Graceful shutdown only.
+ * Never auto-call this during runtime.
+ */
+export async function closePool() {
+  if (!pool) return;
+
+  try {
+    await pool.end();
+    console.log("🧹 DB pool closed");
+  } catch (err) {
+    console.error("⚠️ Error closing pool:", err);
+  } finally {
+    pool = null;
+  }
 }

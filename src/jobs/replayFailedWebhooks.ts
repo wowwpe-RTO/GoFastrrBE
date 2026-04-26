@@ -24,7 +24,18 @@ export async function replayFailedWebhooks(limit = 10) {
         [row.id]
       );
     } catch (err) {
-      console.error("Replay failed:", row.id, err);
-    }
+  await pool.query(
+    `
+    UPDATE failed_webhooks
+    SET attempts = attempts + 1,
+        last_error = $2
+    WHERE id = $1
+    `,
+    [row.id, String(err)]
+  );
+
+  console.error("Replay failed:", row.id, err);
+}
+
   }
 }

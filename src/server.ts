@@ -1,55 +1,137 @@
 import dotenv from "dotenv";
 dotenv.config();
-
+import path from "path";
 import express from "express";
 import cors from "cors";
-import { initDb, getPool } from "./db";
+import crypto from "crypto";
+import http from "http";
+import axios from "axios";
+
+import { getPool, closePool } from "./db";
 
 // Routes
 import authRoutes from "./routes/auth";
 import checkoutRoutes from "./routes/checkout";
 import shopifyAuthRoutes from "./routes/shopifyAuth";
 import shopifyRoutes from "./routes/shopify";
+import refundRoutes from "./routes/refund";
+
+import checkoutPreview from "./routes/checkoutPreview";
 
 // Webhooks
 import shopifyWebhooks from "./shopify/webhooks";
 import razorpayWebhooks from "./routes/razorpayWebhook";
 
 // Jobs
+import { reconcileRazorpayPayments } from "./jobs/razorpayReconcile";
+import { replayFailedWebhooks } from "./jobs/replayFailedWebhooks";
+import { reconcileCheckouts } from "./jobs/reconcileCheckouts";
+import { cleanupExpiredOtps } from "./jobs/otpCleanup";
 import { expireStaleCheckouts } from "./jobs/checkoutTimeout";
+import { reconcileRefunds } from "./jobs/refundReconcile";
 
 const app = express();
-const PORT = Number(process.env.PORT) || 4000;
+let server: http.Server;
+const intervals: NodeJS.Timeout[] = [];
 
-/**
- * Global crash guards
- */
-process.on("unhandledRejection", (reason) => {
-  console.error("🚨 UNHANDLED PROMISE REJECTION", reason);
+
+
+app.use(
+  cors({
+    origin: [
+      "https://wowwpe-test-store.myshopify.com",
+      "https://checkout.wowwpe.io",
+    ],
+    methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+    allowedHeaders: ["Content-Type", "Authorization"],
+    credentials: true,
+  })
+);
+
+
+
+
+/* ======================================================
+   Request ID + Logging
+====================================================== */
+
+app.use((req, res, next) => {
+  const requestId = crypto.randomUUID();
+  (req as any).requestId = requestId;
+  res.setHeader("X-Request-Id", requestId);
+
+  const start = Date.now();
+
+  res.on("finish", () => {
+    console.log(
+      JSON.stringify({
+        event: "http_request",
+        requestId,
+        method: req.method,
+        path: req.originalUrl,
+        status: res.statusCode,
+        durationMs: Date.now() - start,
+      })
+    );
+  });
+
+  next();
 });
 
-process.on("uncaughtException", (err) => {
-  console.error("🚨 UNCAUGHT EXCEPTION", err);
+/* ======================================================
+   Crash Guards (Non-Fatal Network)
+====================================================== */
+
+process.on("uncaughtException", (err: any) => {
+  console.error("🚨 UNCAUGHT EXCEPTION:", err?.message);
+
+  if (
+    err?.code === "ETIMEDOUT" ||
+    err?.code === "ECONNRESET" ||
+    err?.code === "EADDRNOTAVAIL"
+  ) {
+    return;
+  }
+
+  process.exit(1);
 });
 
-/**
- * Boot sequence (STRICT ORDER)
- */
+process.on("unhandledRejection", (reason: any) => {
+  console.error("🚨 UNHANDLED PROMISE:", reason?.message);
+});
+
+/* ======================================================
+   Guarded Background Jobs
+====================================================== */
+
+function guardedInterval(fn: () => Promise<void>, ms: number) {
+  let running = false;
+
+  const t = setInterval(async () => {
+    if (running) return;
+    running = true;
+
+    try {
+      await fn();
+    } catch (err: any) {
+      console.error("⚠️ Background job error:", err?.message);
+    } finally {
+      running = false;
+    }
+  }, ms);
+
+  intervals.push(t);
+}
+
+/* ======================================================
+   Boot
+====================================================== */
+
 async function startServer() {
-  // 1️⃣ Init DB FIRST
-  await initDb();
+  await getPool().query("SELECT 1");
 
-  // 2️⃣ Middleware
-  app.use(
-    cors({
-      origin: "http://localhost:5173",
-      credentials: true,
-    })
-  );
+  /* ---------- Webhooks FIRST ---------- */
 
-  /**
-   * WEBHOOKS — RAW BODY FIRST
-   */
   app.use(
     "/webhooks/razorpay",
     express.raw({ type: "application/json" }),
@@ -62,52 +144,157 @@ async function startServer() {
     shopifyWebhooks
   );
 
-  /**
-   * NORMAL JSON ROUTES
-   */
+  /* ======================================================
+     NEW: Draft Order Webhook
+  ====================================================== */
+
+  app.post(
+    "/webhooks/draft_orders/create",
+    express.raw({ type: "application/json" }),
+    async (req, res) => {
+      try {
+        const body = JSON.parse(req.body.toString());
+
+        console.log(
+          "📦 Shopify draft order created:",
+          body?.id
+        );
+
+        res.status(200).send("ok");
+      } catch (err: any) {
+        console.error(
+          "Draft order webhook error:",
+          err?.message
+        );
+        res.status(200).send("ok");
+      }
+    }
+  );
+
+  /* ---------- JSON Routes ---------- */
+
   app.use(express.json());
 
   app.use("/auth", authRoutes);
   app.use("/checkout", checkoutRoutes);
+  app.use("/checkout", checkoutPreview);
   app.use("/shopify", shopifyAuthRoutes);
   app.use("/shopify", shopifyRoutes);
+  app.use("/payments", refundRoutes);
 
-  /**
-   * HEALTH
-   */
-  app.get("/health", (_, res) => {
-    res.json({ status: "ok" });
+  app.get("/script.js", (req, res) => {
+  res.setHeader("Content-Type", "application/javascript");
+  res.sendFile(path.join(__dirname, "../public/script.js"));
+});
+
+  /* ---------- Health ---------- */
+
+  app.get("/debug/sessions", async (_, res) => {
+    const r = await getPool().query(
+      "SELECT id FROM checkout_sessions ORDER BY created_at DESC LIMIT 5"
+    );
+    res.json(r.rows);
   });
+
+  app.get("/health", (_, res) => res.json({ status: "ok" }));
 
   app.get("/db-health", async (_, res) => {
     try {
-      const pool = getPool();
-      await pool.query("SELECT 1");
+      await getPool().query("SELECT 1");
       res.json({ ok: true });
-    } catch (err) {
-      console.error("DB health failed:", err);
+    } catch {
       res.status(500).json({ ok: false });
     }
   });
 
-  /**
-   * 3️⃣ START SERVER (ONCE)
-   */
-  app.listen(PORT, () => {
+  /* ---------- Root — handles Shopify embedded redirect ---------- */
+  app.get("/", (req, res) => {
+    const shop = req.query.shop as string;
+    const host = req.query.host as string;
+
+    if (!shop) {
+      // No shop param — show install form
+      return res.send(`
+        <html><body style="font-family:sans-serif;padding:40px;max-width:400px;margin:auto">
+          <h2>Wowwpe Checkout</h2>
+          <p>Enter your store to install:</p>
+          <form method="GET" action="/shopify/install">
+            <input name="shop" placeholder="yourstore.myshopify.com"
+              style="padding:10px;width:100%;box-sizing:border-box;margin-bottom:10px;border:1px solid #ccc;border-radius:6px" required />
+            <button type="submit"
+              style="padding:10px 20px;background:#0B7E63;color:white;border:none;border-radius:6px;cursor:pointer;width:100%">
+              Install App
+            </button>
+          </form>
+        </body></html>
+      `);
+    }
+
+    // Has shop + host — embedded load after OAuth, redirect to Shopify admin
+    if (host) {
+      const adminBase = Buffer.from(host, "base64").toString("utf8");
+      return res.redirect(`https://${adminBase}/apps/${process.env.SHOPIFY_CLIENT_ID}`);
+    }
+
+    // Has shop but no host — trigger OAuth
+    return res.redirect(`/shopify/install?shop=${shop}`);
+  });
+
+  /* ---------- Express Error Handler ---------- */
+
+  app.use((err: any, _req: any, res: any, _next: any) => {
+    console.error("Unhandled express error:", err?.message);
+    res.status(500).json({ error: "Internal server error" });
+  });
+
+  const PORT = Number(process.env.PORT) || 4000;
+
+  server = app.listen(PORT, () => {
     console.log(`🚀 Server running on port ${PORT}`);
   });
 
-  /**
-   * 4️⃣ START BACKGROUND JOBS (AFTER DB)
-   */
-  setInterval(() => {
-    expireStaleCheckouts().catch((err) =>
-      console.error("❌ Background job error:", err)
-    );
-  }, 30_000);
+
+
+app.listen(PORT, async () => {
+  console.log(`🚀 Server running on port ${PORT}`);
+
+  try {
+    const ip = await axios.get("https://api.ipify.org?format=json");
+    console.log("🌍 SERVER IP:", ip.data);
+  } catch (err) {
+    console.error("Failed to fetch server IP");
+  }
+});
+
+  /* ======================================================
+     BACKGROUND JOBS
+  ====================================================== */
+
+  // guardedInterval(cleanupExpiredOtps, 600_000);
+  // guardedInterval(expireStaleCheckouts, 600_000);
 }
 
-startServer().catch((err) => {
-  console.error("❌ Failed to start server", err);
+startServer().catch(async (err) => {
+  console.error("❌ Failed to start server:", err?.message);
+  await closePool();
   process.exit(1);
 });
+
+/* ======================================================
+   Graceful Shutdown
+====================================================== */
+
+async function shutdown(signal: string) {
+  console.log(`🛑 ${signal} received. Shutting down...`);
+
+  server.close(async () => {
+    intervals.forEach(clearInterval);
+    await closePool();
+    process.exit(0);
+  });
+
+  setTimeout(() => process.exit(1), 15000);
+}
+
+process.on("SIGTERM", () => shutdown("SIGTERM"));
+process.on("SIGINT", () => shutdown("SIGINT"));
